@@ -1297,6 +1297,8 @@ class ProxyServerSystem extends EventEmitter {
     };
 
     // 1. 处理公开路径和健康检查 (在所有认证之前)
+    // ==================== 用这个包含“状态”+“日志”的最终版本进行完整替换 ====================
+
     app.get("/", (req, res) => {
       // 健康检查逻辑保持不变
       const remoteIp = req.ip;
@@ -1316,7 +1318,7 @@ class ProxyServerSystem extends EventEmitter {
       const invalidIndices = initialIndices.filter(
         (i) => !availableIndices.includes(i)
       );
-      // const logs = this.logger.logBuffer || []; // logs 变量在HTML中不再需要
+      const logs = this.logger.logBuffer || [];
 
       // 构建HTML响应，注意 <head> 部分的变化
       const statusHtml = `
@@ -1329,9 +1331,8 @@ class ProxyServerSystem extends EventEmitter {
           <style>
             body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background-color: #f0f2f5; color: #333; padding: 2em; }
             .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 1em 2em 2em 2em; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            h1 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 0.5em;}
+            h1, h2 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 0.5em;}
             pre { background: #2d2d2d; color: #f0f0f0; font-size: 1.1em; padding: 1.5em; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
-            /* 日志相关的CSS可以保留或删除，不影响功能 */
             #log-container { font-size: 0.9em; max-height: 400px; overflow-y: auto; }
             .status-ok { color: #2ecc71; font-weight: bold; }
             .status-error { color: #e74c3c; font-weight: bold; }
@@ -1384,14 +1385,18 @@ class ProxyServerSystem extends EventEmitter {
       }">${!!browserManager.browser}</span>
               </pre>
             </div>
+            <div id="log-section">
+              <h2>实时日志 (最近 ${logs.length} 条)</h2>
+              <pre id="log-container">${logs.join("\n")}</pre>
             </div>
+          </div>
 
           <script>
             function updateContent() {
-              fetch('/api/status')
+              fetch('/api/status') // 请求新的、轻量级的数据接口
                 .then(response => response.json())
                 .then(data => {
-                  // --- 更新状态区域 (这部分保留) ---
+                  // --- 更新状态区域 ---
                   const statusPre = document.querySelector('#status-section pre');
                   statusPre.innerHTML = \`
 <span class="label">服务状态</span>: <span class="status-ok">Running</span>
@@ -1410,7 +1415,20 @@ class ProxyServerSystem extends EventEmitter {
 --- 连接状态 ---
 <span class="label">浏览器连接</span>: <span class="\${data.status.browserConnected ? "status-ok" : "status-error"}">\${data.status.browserConnected}</span>\`;
 
-                  // --- 更新日志区域的逻辑已被完全移除 ---
+                  // --- 更新日志区域 ---
+                  const logContainer = document.getElementById('log-container');
+                  const logTitle = document.querySelector('#log-section h2');
+
+                  // 检查日志容器是否滚动到底部，以便在更新后保持位置
+                  const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 1;
+
+                  logTitle.innerText = \`实时日志 (最近 \${data.logCount} 条)\`;
+                  logContainer.innerText = data.logs;
+
+                  // 如果之前就在底部，则自动滚动到底部看最新日志
+                  if (isScrolledToBottom) {
+                    logContainer.scrollTop = logContainer.scrollHeight;
+                  }
                 })
                 .catch(error => console.error('Error fetching new content:', error));
             }
@@ -1428,7 +1446,6 @@ class ProxyServerSystem extends EventEmitter {
       res.status(200).send(statusHtml);
     });
 
-    // API 接口 /api/status 保持不变，为前端提供数据
     app.get("/api/status", (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
       const initialIndices = authSource.initialIndices || [];
@@ -1477,7 +1494,6 @@ class ProxyServerSystem extends EventEmitter {
     });
 
     app.get("/favicon.ico", (req, res) => res.status(204).send());
-
     // 2. 保护管理路径
     app.use("/admin", adminAuth);
     app.get("/admin/set-mode", (req, res) => {
@@ -1528,265 +1544,7 @@ class ProxyServerSystem extends EventEmitter {
     // 3. 保护所有其他API路径
     app.use(this._createAuthMiddleware());
     app.all(/(.*)/, (req, res) => {
-      this.requestHandler.processRequest(req, res);
-    });
-
-    return app;
-  }
-  _createExpressApp() {
-    const app = express();
-    const basicAuth = require("basic-auth");
-
-    app.use(express.json({ limit: "100mb" }));
-    app.use(express.raw({ type: "*/*", limit: "100mb" }));
-
-    const adminAuth = (req, res, next) => {
-      const credentials = basicAuth(req);
-      const serverApiKey =
-        (this.config.apiKeys && this.config.apiKeys[0]) || null;
-      if (
-        !credentials ||
-        credentials.name !== "root" ||
-        credentials.pass !== serverApiKey
-      ) {
-        res.setHeader("WWW-Authenticate", 'Basic realm="Admin Area"');
-        return res.status(401).send("Authentication required.");
-      }
-      return next();
-    };
-
-    // 1. 处理公开路径和健康检查 (在所有认证之前)
-    app.get("/", (req, res) => {
-      // 健康检查逻辑保持不变
-      const remoteIp = req.ip;
-      const userAgent = req.headers["user-agent"] || "";
-      const isHealthCheck =
-        remoteIp &&
-        remoteIp.startsWith("10.") &&
-        !userAgent.includes("Mozilla");
-      if (isHealthCheck) {
-        return res.status(200).send("Health check OK.");
-      }
-
-      // 获取数据的逻辑保持不变
-      const { config, requestHandler, authSource, browserManager } = this;
-      const initialIndices = authSource.initialIndices || [];
-      const availableIndices = authSource.availableIndices || [];
-      const invalidIndices = initialIndices.filter(
-        (i) => !availableIndices.includes(i)
-      );
-      // const logs = this.logger.logBuffer || []; // logs 变量在HTML中不再需要
-
-      // 构建HTML响应，注意 <head> 部分的变化
-      const statusHtml = `
-        <!DOCTYPE html>
-        <html lang="zh-CN">
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>代理服务状态</title>
-          <style>
-            body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background-color: #f0f2f5; color: #333; padding: 2em; }
-            .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 1em 2em 2em 2em; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            h1 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 0.5em;}
-            pre { background: #2d2d2d; color: #f0f0f0; font-size: 1.1em; padding: 1.5em; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
-            /* 日志相关的CSS可以保留或删除，不影响功能 */
-            #log-container { font-size: 0.9em; max-height: 400px; overflow-y: auto; }
-            .status-ok { color: #2ecc71; font-weight: bold; }
-            .status-error { color: #e74c3c; font-weight: bold; }
-            .label { display: inline-block; width: 220px; }
-            .dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-left: 10px; animation: blink 1s infinite alternate; }
-            @keyframes blink { from { opacity: 0.3; } to { opacity: 1; } }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <h1>代理服务状态 <span class="dot" title="数据动态刷新中..."></span></h1>
-            <div id="status-section">
-              <pre>
-<span class="label">服务状态</span>: <span class="status-ok">Running</span>
---- 服务配置 ---
-<span class="label">流式模式</span>: ${config.streamingMode}
-<span class="label">次数轮换</span>: ${
-        config.switchOnUses > 0 ? `每 ${config.switchOnUses} 次` : "已禁用"
-      }
-<span class="label">失败切换</span>: ${
-        config.failureThreshold > 0
-          ? `失败 ${config.failureThreshold} 次后切换`
-          : "已禁用"
-      }
-<span class="label">立即切换 (状态码)</span>: ${
-        config.immediateSwitchStatusCodes.length > 0
-          ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
-          : "已禁用"
-      }
---- 账号状态 ---
-<span class="label">扫描到的总账号</span>: [${initialIndices.join(
-        ", "
-      )}] (总数: ${initialIndices.length})
-<span class="label">格式正确 (可用)</span>: [${availableIndices.join(
-        ", "
-      )}] (总数: ${availableIndices.length})
-<span class="label">格式错误 (已忽略)</span>: [${invalidIndices.join(
-        ", "
-      )}] (总数: ${invalidIndices.length})
-<span class="label">当前使用账号</span>: #${requestHandler.currentAuthIndex}
-<span class="label">使用次数计数</span>: ${requestHandler.usageCount} / ${
-        config.switchOnUses > 0 ? config.switchOnUses : "N/A"
-      }
-<span class="label">连续失败计数</span>: ${requestHandler.failureCount} / ${
-        config.failureThreshold > 0 ? config.failureThreshold : "N/A"
-      }
---- 连接状态 ---
-<span class="label">浏览器连接</span>: <span class="${
-        browserManager.browser ? "status-ok" : "status-error"
-      }">${!!browserManager.browser}</span>
-              </pre>
-            </div>
-            </div>
-
-          <script>
-            function updateContent() {
-              fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
-                  // --- 更新状态区域 (这部分保留) ---
-                  const statusPre = document.querySelector('#status-section pre');
-                  statusPre.innerHTML = \`
-<span class="label">服务状态</span>: <span class="status-ok">Running</span>
---- 服务配置 ---
-<span class="label">流式模式</span>: \${data.status.streamingMode}
-<span class="label">次数轮换</span>: \${data.status.switchOnUses}
-<span class="label">失败切换</span>: \${data.status.failureThreshold}
-<span class="label">立即切换 (状态码)</span>: \${data.status.immediateSwitchStatusCodes}
---- 账号状态 ---
-<span class="label">扫描到的总账号</span>: \${data.status.initialIndices}
-<span class="label">格式正确 (可用)</span>: \${data.status.availableIndices}
-<span class="label">格式错误 (已忽略)</span>: \${data.status.invalidIndices}
-<span class="label">当前使用账号</span>: #\${data.status.currentAuthIndex}
-<span class="label">使用次数计数</span>: \${data.status.usageCount}
-<span class="label">连续失败计数</span>: \${data.status.failureCount}
---- 连接状态 ---
-<span class="label">浏览器连接</span>: <span class="\${data.status.browserConnected ? "status-ok" : "status-error"}">\${data.status.browserConnected}</span>\`;
-
-                  // --- 更新日志区域的逻辑已被完全移除 ---
-                })
-                .catch(error => console.error('Error fetching new content:', error));
-            }
-
-            // 页面加载后先立即执行一次，然后设置定时器
-            document.addEventListener('DOMContentLoaded', () => {
-              updateContent();
-              setInterval(updateContent, 5000);
-            });
-          </script>
-        </body>
-        </html>
-      `;
-
-      res.status(200).send(statusHtml);
-    });
-
-    // API 接口 /api/status 保持不变，为前端提供数据
-    app.get("/api/status", (req, res) => {
-      const { config, requestHandler, authSource, browserManager } = this;
-      const initialIndices = authSource.initialIndices || [];
-      const availableIndices = authSource.availableIndices || [];
-      const invalidIndices = initialIndices.filter(
-        (i) => !availableIndices.includes(i)
-      );
-      const logs = this.logger.logBuffer || [];
-
-      const data = {
-        status: {
-          streamingMode: config.streamingMode,
-          switchOnUses:
-            config.switchOnUses > 0 ? `每 ${config.switchOnUses} 次` : "已禁用",
-          failureThreshold:
-            config.failureThreshold > 0
-              ? `失败 ${config.failureThreshold} 次后切换`
-              : "已禁用",
-          immediateSwitchStatusCodes:
-            config.immediateSwitchStatusCodes.length > 0
-              ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
-              : "已禁用",
-          initialIndices: `[${initialIndices.join(", ")}] (总数: ${
-            initialIndices.length
-          })`,
-          availableIndices: `[${availableIndices.join(", ")}] (总数: ${
-            availableIndices.length
-          })`,
-          invalidIndices: `[${invalidIndices.join(", ")}] (总数: ${
-            invalidIndices.length
-          })`,
-          currentAuthIndex: requestHandler.currentAuthIndex,
-          usageCount: `${requestHandler.usageCount} / ${
-            config.switchOnUses > 0 ? config.switchOnUses : "N/A"
-          }`,
-          failureCount: `${requestHandler.failureCount} / ${
-            config.failureThreshold > 0 ? config.failureThreshold : "N/A"
-          }`,
-          browserConnected: !!browserManager.browser,
-        },
-        logs: logs.join("\n"),
-        logCount: logs.length,
-      };
-
-      res.json(data);
-    });
-
-    app.get("/favicon.ico", (req, res) => res.status(204).send());
-
-    // 2. 保护管理路径
-    app.use("/admin", adminAuth);
-    app.get("/admin/set-mode", (req, res) => {
-      const newMode = req.query.mode;
-      if (newMode === "fake" || newMode === "real") {
-        this.streamingMode = newMode;
-        this.logger.info(
-          `[Admin] 流式模式已由认证用户切换为: ${this.streamingMode}`
-        );
-        res.status(200).send(`流式模式已切换为: ${this.streamingMode}`);
-      } else {
-        res.status(400).send('无效模式. 请用 "fake" 或 "real".');
-      }
-    });
-
-    app.get("/admin/switch", async (req, res) => {
-      this.logger.info("[Admin] 收到手动切换账号请求...");
-
-      if (this.authSource.availableIndices.length <= 1) {
-        const userMessage = "⚠️ 切换操作已取消：只有一个可用账号，无法切换。";
-        this.logger.warn(`[Admin] ${userMessage}`);
-        return res.status(400).send(userMessage);
-      }
-
-      const currentAuth = this.requestHandler.currentAuthIndex;
-
-      try {
-        const result = await this.requestHandler._switchToNextAuth();
-
-        if (result.success) {
-          const message = `✅ 手动切换成功！已从账号 ${currentAuth} 切换到账号 ${result.newIndex}。`;
-          this.logger.info(`[Admin] ${message}`);
-          res.status(200).send(message);
-        } else if (result.fallback) {
-          const message = `⚠️ 切换失败，但已成功回退到账号 #${result.newIndex}。请检查目标账号是否存在问题。`;
-          this.logger.warn(`[Admin] ${message}`);
-          res.status(200).send(message);
-        } else {
-          res.status(409).send(`操作未执行: ${result.reason}`);
-        }
-      } catch (error) {
-        const message = `❌ 致命错误：切换和回退均失败，服务可能已中断！错误: ${error.message}`;
-        this.logger.error(`[Admin] ${message}`);
-        res.status(500).send(message);
-      }
-    });
-
-    // 3. 保护所有其他API路径
-    app.use(this._createAuthMiddleware());
-    app.all(/(.*)/, (req, res) => {
+      // [关键修复] 原本在这里的 if 判断已提到前面，这里不再需要
       this.requestHandler.processRequest(req, res);
     });
 
