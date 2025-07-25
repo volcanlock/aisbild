@@ -87,7 +87,7 @@ class RequestProcessor {
   constructor() {
     this.activeOperations = new Map();
     this.targetDomain = "generativelanguage.googleapis.com";
-    this.maxRetries = 2; // 最多尝试3次
+    this.maxRetries = 3; // 最多尝试3次
     this.retryDelay = 2000; // 每次重试前等待2秒
   }
 
