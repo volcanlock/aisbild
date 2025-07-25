@@ -1138,7 +1138,7 @@ class ProxyServerSystem extends EventEmitter {
       streamingMode: "fake",
       failureThreshold: 3,
       switchOnUses: 40,
-      maxRetries: 2,
+      maxRetries: 1,
       retryDelay: 2000,
       browserExecutablePath: null,
       apiKeys: [],
