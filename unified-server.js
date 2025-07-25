@@ -1374,9 +1374,7 @@ class ProxyServerSystem extends EventEmitter {
     const basicAuth = require("basic-auth");
 
     app.use((req, res, next) => {
-      this.logger.info(
-        `[ENTRY] Request received: ${req.method} ${req.originalUrl} from IP ${req.ip}`
-      );
+      res.setHeader("Connection", "close");
       next();
     });
 
