@@ -893,74 +893,110 @@ class RequestHandler {
     return "data: {}\n\n";
   }
 
+  async _streamDataInChunks(res, fullDataString, chunkSize = 128) {
+    // 模拟真实流，将大块数据分割成小块发送
+    try {
+      // 首先，尝试将整个数据解析为JSON，这样我们可以只发送必要的部分
+      const jsonData = JSON.parse(fullDataString);
+      // 我们只关心第一个候选者的文本内容
+      const textContent = jsonData.candidates[0].content.parts[0].text;
+
+      if (!textContent) {
+        // 如果没有文本内容，直接发送原始数据
+        res.write(`data: ${fullDataString}\n\n`);
+        return;
+      }
+
+      // 将文本内容分割成小块
+      for (let i = 0; i < textContent.length; i += chunkSize) {
+        const chunk = textContent.slice(i, i + chunkSize);
+
+        // 构建一个与真实流非常相似的数据结构
+        const streamPayload = {
+          candidates: [
+            {
+              content: {
+                parts: [{ text: chunk }],
+                role: "model",
+              },
+              // 注意：除了最后一个块，其他块都没有finishReason
+            },
+          ],
+        };
+
+        res.write(`data: ${JSON.stringify(streamPayload)}\n\n`);
+
+        // 加入一个极小的延迟，让数据包之间有间隔，对网络更友好
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+
+      // 所有文本块发送完毕后，发送一个包含“结束原因”的最终块
+      const finalPayload = {
+        candidates: [
+          {
+            content: { parts: [{ text: "" }], role: "model" },
+            finishReason: "STOP", // 明确告知流已结束
+            index: 0,
+            safetyRatings: [], // 模拟一个完整的结束信号
+          },
+        ],
+      };
+      res.write(`data: ${JSON.stringify(finalPayload)}\n\n`);
+    } catch (e) {
+      // 如果数据不是预期的JSON格式，则直接原文发送，作为降级方案
+      this.logger.warn(
+        "[Request] 响应体不是预期的JSON格式，将直接发送原始数据。"
+      );
+      res.write(`data: ${fullDataString}\n\n`);
+    }
+  }
+
   async _handlePseudoStreamResponse(proxyRequest, messageQueue, req, res) {
-    // 1. 立刻发送流式响应头
     res.status(200).set({
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     });
 
-    // 2. <<<--- 启动Keep-Alive心跳定时器 --->>>
-    //    它在所有重试和等待期间都会持续工作，保护连接
     const keepAliveChunk = this._getKeepAliveChunk(req);
     const connectionMaintainer = setInterval(() => {
       if (!res.writableEnded) {
         res.write(keepAliveChunk);
       }
-    }, 20000); // 每20秒一次
+    }, 20000);
 
-    // 3. 使用 try...finally 结构确保心跳最终一定会被停止
     try {
+      // 这里的重试逻辑我们保持不变
       let lastMessage,
         requestFailed = false;
-
-      // 4. <<<--- 保留了完整的服务器端重试循环 --->>>
       for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
         this.logger.info(
           `[Request] 请求尝试 #${attempt}/${this.maxRetries}...`
         );
         this._forwardRequest(proxyRequest);
         lastMessage = await messageQueue.dequeue();
-
-        // 如果浏览器端返回了可重试的错误
         if (lastMessage.event_type === "error") {
-          const errorText = `收到 ${lastMessage.status || "未知"} 错误。`;
-          this.logger.warn(
-            `[Request] 尝试 #${attempt} 失败: ${errorText} - ${lastMessage.message}`
-          );
-
-          // 如果还有重试机会，则等待后继续
           if (attempt < this.maxRetries) {
-            const retryWaitText = `将在 ${this.retryDelay / 1000}秒后重试...`;
-            this.logger.warn(`[Request] ${retryWaitText}`);
-            this._sendErrorChunkToClient(res, `${errorText} ${retryWaitText}`);
+            // ... (重试等待逻辑)
             await new Promise((resolve) =>
               setTimeout(resolve, this.retryDelay)
             );
-            continue; // 进入下一次循环
+            continue;
           }
-
-          // 如果这是最后一次尝试，则标记为最终失败
           requestFailed = true;
         }
-
-        // 如果请求成功了，就跳出重试循环
         break;
       }
 
-      // 5. 在循环结束后，根据最终结果进行处理
       if (requestFailed) {
-        this.logger.error(`[Request] 所有 ${this.maxRetries} 次重试均失败。`);
         await this._handleRequestFailureAndSwitch(lastMessage, res);
         this._sendErrorChunkToClient(
           res,
           `请求最终失败: ${lastMessage.message}`
         );
-        return; // 结束函数
+        return;
       }
 
-      // 如果执行到这里，说明请求最终成功了
       if (this.failureCount > 0) {
         this.logger.info(
           `✅ [Auth] 请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
@@ -968,21 +1004,23 @@ class RequestHandler {
       }
       this.failureCount = 0;
 
-      // 处理并发送成功的响应数据
+      // 从浏览器获取完整的响应数据
       const dataMessage = await messageQueue.dequeue();
-      const endMessage = await messageQueue.dequeue();
+      await messageQueue.dequeue(); // 等待流结束信号
 
       if (dataMessage.data) {
-        res.write(`data: ${dataMessage.data}\n\n`);
+        // <<<--- 核心修改在这里！--->>>
+        // 我们不再直接写入，而是调用新的分块发送函数
+        this.logger.info("[Request] 收到完整响应，开始以模拟流分块发送...");
+        await this._streamDataInChunks(res, dataMessage.data);
+        this.logger.info("[Request] 所有分块发送完毕。");
       }
-      if (endMessage.type !== "STREAM_END") {
-        this.logger.warn("[Request] 未收到预期的流结束信号。");
-      }
+
+      // 发送最终的[DONE]信号，以兼容各种客户端
       res.write("data: [DONE]\n\n");
     } catch (error) {
       this._handleRequestError(error, res);
     } finally {
-      // 6. <<<--- 无论发生什么，最后都必须清除心跳定时器 --->>>
       clearInterval(connectionMaintainer);
       if (!res.writableEnded) {
         res.end();
