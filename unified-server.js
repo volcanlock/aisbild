@@ -1373,6 +1373,13 @@ class ProxyServerSystem extends EventEmitter {
     const app = express();
     const basicAuth = require("basic-auth");
 
+    app.use((req, res, next) => {
+      this.logger.info(
+        `[ENTRY] Request received: ${req.method} ${req.originalUrl} from IP ${req.ip}`
+      );
+      next();
+    });
+
     app.use(express.json({ limit: "100mb" }));
     app.use(express.raw({ type: "*/*", limit: "100mb" }));
 
