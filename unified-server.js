@@ -894,23 +894,28 @@ class RequestHandler {
   }
 
   async _handlePseudoStreamResponse(proxyRequest, messageQueue, req, res) {
+    // 1. 立刻发送流式响应头
     res.status(200).set({
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     });
-    this.logger.info("[Request] 已向客户端发送初始响应头，并启动Keep-Alive。");
 
+    // 2. <<<--- 启动Keep-Alive心跳定时器 --->>>
+    //    它在所有重试和等待期间都会持续工作，保护连接
     const keepAliveChunk = this._getKeepAliveChunk(req);
     const connectionMaintainer = setInterval(() => {
-      if (!res.writableEnded) res.write(keepAliveChunk);
-    }, 20000);
+      if (!res.writableEnded) {
+        res.write(keepAliveChunk);
+      }
+    }, 20000); // 每20秒一次
 
+    // 3. 使用 try...finally 结构确保心跳最终一定会被停止
     try {
       let lastMessage,
         requestFailed = false;
 
-      // <<<--- 关键修改：在这里加入了 for 循环重试机制 --->>>
+      // 4. <<<--- 保留了完整的服务器端重试循环 --->>>
       for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
         this.logger.info(
           `[Request] 请求尝试 #${attempt}/${this.maxRetries}...`
@@ -918,47 +923,44 @@ class RequestHandler {
         this._forwardRequest(proxyRequest);
         lastMessage = await messageQueue.dequeue();
 
-        // 如果浏览器端直接返回了错误
+        // 如果浏览器端返回了可重试的错误
         if (lastMessage.event_type === "error") {
           const errorText = `收到 ${lastMessage.status || "未知"} 错误。`;
           this.logger.warn(
             `[Request] 尝试 #${attempt} 失败: ${errorText} - ${lastMessage.message}`
           );
 
-          // 如果还有重试机会
+          // 如果还有重试机会，则等待后继续
           if (attempt < this.maxRetries) {
             const retryWaitText = `将在 ${this.retryDelay / 1000}秒后重试...`;
             this.logger.warn(`[Request] ${retryWaitText}`);
-            // 向客户端发送一个提示信息
             this._sendErrorChunkToClient(res, `${errorText} ${retryWaitText}`);
-            // 等待一段时间
             await new Promise((resolve) =>
               setTimeout(resolve, this.retryDelay)
             );
-            // 继续下一次循环
-            continue;
+            continue; // 进入下一次循环
           }
 
-          // 如果这是最后一次尝试，标记为失败
+          // 如果这是最后一次尝试，则标记为最终失败
           requestFailed = true;
         }
-        // 如果请求成功了，就跳出循环
+
+        // 如果请求成功了，就跳出重试循环
         break;
       }
 
-      // <<<--- 在循环结束后，检查最终结果 --->>>
+      // 5. 在循环结束后，根据最终结果进行处理
       if (requestFailed) {
         this.logger.error(`[Request] 所有 ${this.maxRetries} 次重试均失败。`);
-        // 在这里，我们触发账号切换逻辑
         await this._handleRequestFailureAndSwitch(lastMessage, res);
         this._sendErrorChunkToClient(
           res,
           `请求最终失败: ${lastMessage.message}`
         );
-        return; // 结束处理
+        return; // 结束函数
       }
 
-      // 如果执行到这里，说明请求成功了
+      // 如果执行到这里，说明请求最终成功了
       if (this.failureCount > 0) {
         this.logger.info(
           `✅ [Auth] 请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
@@ -966,6 +968,7 @@ class RequestHandler {
       }
       this.failureCount = 0;
 
+      // 处理并发送成功的响应数据
       const dataMessage = await messageQueue.dequeue();
       const endMessage = await messageQueue.dequeue();
 
@@ -979,6 +982,7 @@ class RequestHandler {
     } catch (error) {
       this._handleRequestError(error, res);
     } finally {
+      // 6. <<<--- 无论发生什么，最后都必须清除心跳定时器 --->>>
       clearInterval(connectionMaintainer);
       if (!res.writableEnded) {
         res.end();
@@ -1345,14 +1349,9 @@ class ProxyServerSystem extends EventEmitter {
     const app = this._createExpressApp();
     this.httpServer = http.createServer(app);
 
-    // <<<--- 关键新增：在这里设置服务器的超时策略 --->>>
-    // 设置Keep-Alive超时为30秒。
-    // Node.js会主动在连接空闲30秒后发送关闭信号。
-    this.httpServer.keepAliveTimeout = 15000;
-
-    // 设置请求头超时为35秒。
-    // 确保在Keep-Alive超时后，服务器有足够的时间来处理关闭前的最后一个请求头。
-    this.httpServer.headersTimeout = 20000;
+    // 设置一个比多数网关默认超时（如60s）短的Keep-Alive超时
+    this.httpServer.keepAliveTimeout = 25000; // 25秒
+    this.httpServer.headersTimeout = 30000; // 30秒
 
     return new Promise((resolve) => {
       this.httpServer.listen(this.config.httpPort, this.config.host, () => {
@@ -1360,7 +1359,7 @@ class ProxyServerSystem extends EventEmitter {
           `[System] HTTP服务器已在 http://${this.config.host}:${this.config.httpPort} 上监听`
         );
         this.logger.info(
-          `[System] Keep-Alive 超时已设置为 ${
+          `[System] 主动Keep-Alive超时已设置为 ${
             this.httpServer.keepAliveTimeout / 1000
           } 秒。`
         );
@@ -1372,11 +1371,6 @@ class ProxyServerSystem extends EventEmitter {
   _createExpressApp() {
     const app = express();
     const basicAuth = require("basic-auth");
-
-    app.use((req, res, next) => {
-      res.setHeader("Connection", "close");
-      next();
-    });
 
     app.use(express.json({ limit: "100mb" }));
     app.use(express.raw({ type: "*/*", limit: "100mb" }));
