@@ -346,11 +346,15 @@ class BrowserManager {
       });
       this.logger.info("[Browser] 编辑器已出现，准备粘贴脚本。");
 
-      await editorContainerLocator.click();
+      this.logger.info("[Browser] 暂停3秒并模拟点击以确保页面激活...");
+      await this.page.waitForTimeout(3000); // 无条件等待3秒
+      await editorContainerLocator.click({ timeout: 60000 }); // 再次点击编辑器，确保它是焦点
+
       await this.page.evaluate(
         (text) => navigator.clipboard.writeText(text),
         buildScriptContent
       );
+
       const isMac = os.platform() === "darwin";
       const pasteKey = isMac ? "Meta+V" : "Control+V";
       await this.page.keyboard.press(pasteKey);
@@ -859,52 +863,128 @@ class RequestHandler {
     }
   }
 
+  _getKeepAliveChunk(req) {
+    if (req.path.includes("chat/completions")) {
+      const payload = {
+        id: `chatcmpl-${this._generateRequestId()}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-4",
+        choices: [{ index: 0, delta: {}, finish_reason: null }],
+      };
+      return `data: ${JSON.stringify(payload)}\n\n`;
+    }
+    if (
+      req.path.includes("generateContent") ||
+      req.path.includes("streamGenerateContent")
+    ) {
+      const payload = {
+        candidates: [
+          {
+            content: { parts: [{ text: "" }], role: "model" },
+            finishReason: null,
+            index: 0,
+            safetyRatings: [],
+          },
+        ],
+      };
+      return `data: ${JSON.stringify(payload)}\n\n`;
+    }
+    return "data: {}\n\n";
+  }
+
   async _handlePseudoStreamResponse(proxyRequest, messageQueue, req, res) {
     res.status(200).set({
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     });
-    this.logger.info("[Request] 已向客户端发送初始响应头。");
+    this.logger.info("[Request] 已向客户端发送初始响应头，并启动Keep-Alive。");
 
-    // 发出请求，不再有服务器端的for循环重试
-    this.logger.info(`[Request] 请求已派发给浏览器端处理...`);
-    this._forwardRequest(proxyRequest);
+    const keepAliveChunk = this._getKeepAliveChunk(req);
+    const connectionMaintainer = setInterval(() => {
+      if (!res.writableEnded) res.write(keepAliveChunk);
+    }, 20000);
 
-    // 直接等待浏览器端的最终结果
-    const headerMessage = await messageQueue.dequeue();
+    try {
+      let lastMessage,
+        requestFailed = false;
 
-    // 如果浏览器直接返回错误
-    if (headerMessage.event_type === "error") {
-      await this._handleRequestFailureAndSwitch(headerMessage, res);
-      this._sendErrorChunkToClient(
-        res,
-        `浏览器端报告错误: ${headerMessage.message}`
-      );
-      if (!res.writableEnded) res.end();
-      return;
+      // <<<--- 关键修改：在这里加入了 for 循环重试机制 --->>>
+      for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+        this.logger.info(
+          `[Request] 请求尝试 #${attempt}/${this.maxRetries}...`
+        );
+        this._forwardRequest(proxyRequest);
+        lastMessage = await messageQueue.dequeue();
+
+        // 如果浏览器端直接返回了错误
+        if (lastMessage.event_type === "error") {
+          const errorText = `收到 ${lastMessage.status || "未知"} 错误。`;
+          this.logger.warn(
+            `[Request] 尝试 #${attempt} 失败: ${errorText} - ${lastMessage.message}`
+          );
+
+          // 如果还有重试机会
+          if (attempt < this.maxRetries) {
+            const retryWaitText = `将在 ${this.retryDelay / 1000}秒后重试...`;
+            this.logger.warn(`[Request] ${retryWaitText}`);
+            // 向客户端发送一个提示信息
+            this._sendErrorChunkToClient(res, `${errorText} ${retryWaitText}`);
+            // 等待一段时间
+            await new Promise((resolve) =>
+              setTimeout(resolve, this.retryDelay)
+            );
+            // 继续下一次循环
+            continue;
+          }
+
+          // 如果这是最后一次尝试，标记为失败
+          requestFailed = true;
+        }
+        // 如果请求成功了，就跳出循环
+        break;
+      }
+
+      // <<<--- 在循环结束后，检查最终结果 --->>>
+      if (requestFailed) {
+        this.logger.error(`[Request] 所有 ${this.maxRetries} 次重试均失败。`);
+        // 在这里，我们触发账号切换逻辑
+        await this._handleRequestFailureAndSwitch(lastMessage, res);
+        this._sendErrorChunkToClient(
+          res,
+          `请求最终失败: ${lastMessage.message}`
+        );
+        return; // 结束处理
+      }
+
+      // 如果执行到这里，说明请求成功了
+      if (this.failureCount > 0) {
+        this.logger.info(
+          `✅ [Auth] 请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
+        );
+      }
+      this.failureCount = 0;
+
+      const dataMessage = await messageQueue.dequeue();
+      const endMessage = await messageQueue.dequeue();
+
+      if (dataMessage.data) {
+        res.write(`data: ${dataMessage.data}\n\n`);
+      }
+      if (endMessage.type !== "STREAM_END") {
+        this.logger.warn("[Request] 未收到预期的流结束信号。");
+      }
+      res.write("data: [DONE]\n\n");
+    } catch (error) {
+      this._handleRequestError(error, res);
+    } finally {
+      clearInterval(connectionMaintainer);
+      if (!res.writableEnded) {
+        res.end();
+      }
+      this.logger.info("[Request] 假流式响应处理结束。");
     }
-
-    // 正常处理成功的响应
-    if (this.failureCount > 0) {
-      this.logger.info(
-        `✅ [Auth] 请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
-      );
-    }
-    this.failureCount = 0;
-
-    const dataMessage = await messageQueue.dequeue();
-    const endMessage = await messageQueue.dequeue();
-
-    if (dataMessage.data) {
-      res.write(`data: ${dataMessage.data}\n\n`);
-      this.logger.info("[Request] 已将完整响应体作为SSE事件发送。");
-    }
-    if (endMessage.type !== "STREAM_END")
-      this.logger.warn("[Request] 未收到预期的流结束信号。");
-
-    if (!res.writableEnded) res.end();
-    this.logger.info("[Request] 假流式响应处理结束。");
   }
 
   async _handleRealStreamResponse(proxyRequest, messageQueue, res) {
@@ -1058,7 +1138,7 @@ class ProxyServerSystem extends EventEmitter {
       streamingMode: "fake",
       failureThreshold: 3,
       switchOnUses: 40,
-      maxRetries: 1,
+      maxRetries: 2,
       retryDelay: 2000,
       browserExecutablePath: null,
       apiKeys: [],
