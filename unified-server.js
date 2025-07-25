@@ -1344,10 +1344,25 @@ class ProxyServerSystem extends EventEmitter {
   async _startHttpServer() {
     const app = this._createExpressApp();
     this.httpServer = http.createServer(app);
+
+    // <<<--- 关键新增：在这里设置服务器的超时策略 --->>>
+    // 设置Keep-Alive超时为30秒。
+    // Node.js会主动在连接空闲30秒后发送关闭信号。
+    this.httpServer.keepAliveTimeout = 30000;
+
+    // 设置请求头超时为35秒。
+    // 确保在Keep-Alive超时后，服务器有足够的时间来处理关闭前的最后一个请求头。
+    this.httpServer.headersTimeout = 35000;
+
     return new Promise((resolve) => {
       this.httpServer.listen(this.config.httpPort, this.config.host, () => {
         this.logger.info(
           `[System] HTTP服务器已在 http://${this.config.host}:${this.config.httpPort} 上监听`
+        );
+        this.logger.info(
+          `[System] Keep-Alive 超时已设置为 ${
+            this.httpServer.keepAliveTimeout / 1000
+          } 秒。`
         );
         resolve();
       });
