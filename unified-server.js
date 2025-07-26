@@ -657,7 +657,8 @@ class RequestHandler {
         await this.browserManager.launchBrowser(previousAuthIndex);
         this.logger.info(`✅ [Auth] 成功回退到账号 #${previousAuthIndex}！`);
         this.failureCount = 0;
-        this.logger.info("[Auth] 失败计数已在回退成功后重置为0。");
+        this.usageCount = 0;
+        this.logger.info("[Auth] 失败和使用计数已在回退成功后重置为0。");
         this.isAuthSwitching = false;
         return {
           success: false,
