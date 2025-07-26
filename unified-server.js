@@ -1223,23 +1223,46 @@ class ProxyServerSystem extends EventEmitter {
     );
   }
 
-  async start() {
-    this.logger.info(
-      "[System] 开始弹性启动流程，将尝试所有可用账号直到成功..."
-    );
-    const availableIndices = this.authSource.availableIndices;
+  async start(initialAuthIndex = null) {
+    // <<<--- 1. 重新接收参数
+    this.logger.info("[System] 开始弹性启动流程...");
+    const allAvailableIndices = this.authSource.availableIndices;
 
-    if (availableIndices.length === 0) {
-      // 这个情况在AuthSource的构造函数里已经处理了，但为了保险再次检查
+    if (allAvailableIndices.length === 0) {
       throw new Error("没有任何可用的认证源，无法启动。");
     }
 
+    // 2. <<<--- 创建一个优先尝试的启动顺序列表 --->>>
+    let startupOrder = [...allAvailableIndices];
+    if (initialAuthIndex && allAvailableIndices.includes(initialAuthIndex)) {
+      this.logger.info(
+        `[System] 检测到指定启动索引 #${initialAuthIndex}，将优先尝试。`
+      );
+      // 将指定索引放到数组第一位，其他索引保持原状
+      startupOrder = [
+        initialAuthIndex,
+        ...allAvailableIndices.filter((i) => i !== initialAuthIndex),
+      ];
+    } else {
+      if (initialAuthIndex) {
+        this.logger.warn(
+          `[System] 指定的启动索引 #${initialAuthIndex} 无效或不可用，将按默认顺序启动。`
+        );
+      }
+      this.logger.info(
+        `[System] 未指定有效启动索引，将按默认顺序 [${startupOrder.join(
+          ", "
+        )}] 尝试。`
+      );
+    }
+
     let isStarted = false;
-    for (const index of availableIndices) {
+    // 3. <<<--- 遍历这个新的、可能被重排过的顺序列表 --->>>
+    for (const index of startupOrder) {
       try {
         this.logger.info(`[System] 尝试使用账号 #${index} 启动服务...`);
         await this.browserManager.launchBrowser(index);
-        // 如果 aunchBrowser 没有抛出错误，说明启动成功
+
         isStarted = true;
         this.logger.info(`[System] ✅ 使用账号 #${index} 成功启动！`);
         break; // 成功启动，跳出循环
