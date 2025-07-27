@@ -875,7 +875,7 @@ class RequestHandler {
     const keepAliveChunk = this._getKeepAliveChunk(req);
     const connectionMaintainer = setInterval(() => {
       if (!res.writableEnded) res.write(keepAliveChunk);
-    }, 20000);
+    }, 10000);
 
     try {
       let lastMessage,
