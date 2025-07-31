@@ -897,55 +897,72 @@ class RequestHandler {
       let lastMessage,
         requestFailed = false;
 
-      // <<<--- 关键修改：在这里加入了 for 循环重试机制 --->>>
       for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-        this.logger.info(
-          `[Request] 请求尝试 #${attempt}/${this.maxRetries}...`
-        );
+        if (attempt > 1) {
+          this.logger.info(
+            `[Request] 请求尝试 #${attempt}/${this.maxRetries}...`
+          );
+        }
         this._forwardRequest(proxyRequest);
-        lastMessage = await messageQueue.dequeue();
 
-        // 如果浏览器端直接返回了错误
+        // --- 关键修改在这里 ---
+        try {
+          // 创建一个超时Promise，比如90秒
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new Error("Response from browser timed out after 300 seconds")
+                ),
+              300000
+            )
+          );
+          // 让“等待消息”和“超时”进行赛跑
+          lastMessage = await Promise.race([
+            messageQueue.dequeue(),
+            timeoutPromise,
+          ]);
+        } catch (timeoutError) {
+          // 如果是超时错误，就把它当作一个普通的浏览器错误来处理
+          this.logger.error(`[Request] 致命错误: ${timeoutError.message}`);
+          lastMessage = {
+            event_type: "error",
+            status: 504,
+            message: timeoutError.message,
+          };
+        }
+        // --- 修改结束 ---
+
         if (lastMessage.event_type === "error") {
           const errorText = `收到 ${lastMessage.status || "未知"} 错误。`;
           this.logger.warn(
             `[Request] 尝试 #${attempt} 失败: ${errorText} - ${lastMessage.message}`
           );
 
-          // 如果还有重试机会
           if (attempt < this.maxRetries) {
             const retryWaitText = `将在 ${this.retryDelay / 1000}秒后重试...`;
             this.logger.warn(`[Request] ${retryWaitText}`);
-            // 向客户端发送一个提示信息
             this._sendErrorChunkToClient(res, `${errorText} ${retryWaitText}`);
-            // 等待一段时间
             await new Promise((resolve) =>
               setTimeout(resolve, this.retryDelay)
             );
-            // 继续下一次循环
             continue;
           }
-
-          // 如果这是最后一次尝试，标记为失败
           requestFailed = true;
         }
-        // 如果请求成功了，就跳出循环
         break;
       }
 
-      // <<<--- 在循环结束后，检查最终结果 --->>>
       if (requestFailed) {
         this.logger.error(`[Request] 所有 ${this.maxRetries} 次重试均失败。`);
-        // 在这里，我们触发账号切换逻辑
         await this._handleRequestFailureAndSwitch(lastMessage, res);
         this._sendErrorChunkToClient(
           res,
           `请求最终失败: ${lastMessage.message}`
         );
-        return; // 结束处理
+        return;
       }
 
-      // 如果执行到这里，说明请求成功了
       if (this.failureCount > 0) {
         this.logger.info(
           `✅ [Auth] 请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
@@ -957,7 +974,41 @@ class RequestHandler {
       const endMessage = await messageQueue.dequeue();
 
       if (dataMessage.data) {
-        res.write(`data: ${dataMessage.data}\n\n`);
+        try {
+          // 尝试解析data字段，看看里面有没有我们关心的额外信息
+          const fullResponse = JSON.parse(dataMessage.data);
+          if (
+            fullResponse.candidates &&
+            Array.isArray(fullResponse.candidates)
+          ) {
+            fullResponse.candidates.forEach((candidate, i) => {
+              // 如果finishReason存在且不为正常的'STOP'，就发出警告
+              if (candidate.finishReason && candidate.finishReason !== "STOP") {
+                this.logger.warn(
+                  `[Server Diagnostics] 响应 #${i} 被提前终止！原因为: ${candidate.finishReason}`
+                );
+              }
+              // 如果有安全评级，也检查一下
+              if (candidate.safetyRatings) {
+                const highRiskRatings = candidate.safetyRatings.filter(
+                  (r) =>
+                    r.probability !== "NEGLIGIBLE" && r.probability !== "LOW"
+                );
+                if (highRiskRatings.length > 0) {
+                  this.logger.warn(
+                    `[Server Diagnostics] 检测到安全风险: ${JSON.stringify(
+                      highRiskRatings
+                    )}`
+                  );
+                }
+              }
+            });
+          }
+        } catch (e) {
+          // 如果解析失败，说明data字段只是纯文本或格式不符，忽略即可
+        }
+        // --- 日志诊断代码结束 ---
+        res.write(`data: ${JSON.stringify(dataMessage.data)}\n\n`); // 注意：这里需要把整个data对象作为JSON字符串发送
       }
       if (endMessage.type !== "STREAM_END") {
         this.logger.warn("[Request] 未收到预期的流结束信号。");
