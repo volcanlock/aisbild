@@ -86,6 +86,7 @@ class ConnectionManager extends EventTarget {
 class RequestProcessor {
   constructor() {
     this.activeOperations = new Map();
+    this.cancelledOperations = new Set();
     this.targetDomain = "generativelanguage.googleapis.com";
     this.maxRetries = 3; // 最多尝试3次
     this.retryDelay = 2000; // 每次重试前等待2秒
@@ -256,11 +257,11 @@ class RequestProcessor {
     return sanitized;
   }
   cancelOperation(operationId) {
+    this.cancelledOperations.add(operationId); // 核心：将ID加入取消集合
     const controller = this.activeOperations.get(operationId);
     if (controller) {
       Logger.output(`收到取消指令，正在中止操作 #${operationId}...`);
-      controller.abort(); // 中止与此操作关联的 fetch 请求
-      this.activeOperations.delete(operationId); // 从活动列表中移除
+      controller.abort();
     }
   }
 }
@@ -333,73 +334,67 @@ class ProxySystem extends EventTarget {
     const operationId = requestSpec.request_id;
     const mode = requestSpec.streaming_mode || "fake";
 
-    const { responsePromise, cancelTimeout } = this.requestProcessor.execute(
-      requestSpec,
-      operationId
-    );
-
     try {
+      const { responsePromise, cancelTimeout } = this.requestProcessor.execute(
+        requestSpec,
+        operationId
+      );
+
       const response = await responsePromise;
+
+      // ======================= 核心防御逻辑 =======================
+      // 检查这个操作ID是否在我们等待期间被加入了“取消黑名单”
+      if (this.requestProcessor.cancelledOperations.has(operationId)) {
+        Logger.output(
+          `[诊断] 操作 #${operationId} 已被取消，响应结果将被丢弃。`
+        );
+        // 无需做任何事，直接在 finally 中清理后退出
+        return;
+      }
+      // ==========================================================
+
       this._transmitHeaders(response, operationId);
 
       const reader = response.body.getReader();
       const textDecoder = new TextDecoder();
       let timeoutCancelled = false;
-      let fullBody = ""; // 用于假流式模式
+      let fullBody = "";
 
-      // [新增] 用于在流式模式下记录最终结束原因的变量
       let finalFinishReason = "UNKNOWN";
 
       while (true) {
         const { done, value } = await reader.read();
-
-        if (done) {
-          break; // 流已结束
-        }
-
+        if (done) break;
         if (!timeoutCancelled) {
           cancelTimeout();
           timeoutCancelled = true;
         }
-
         const chunk = textDecoder.decode(value, { stream: true });
 
-        // [新增逻辑] 如果是真流式，实时解析每个数据块以捕获最后的 finishReason
         if (mode === "real") {
           const lines = chunk.split("\n");
           for (const line of lines) {
             if (line.startsWith("data: ")) {
               try {
                 const jsonData = JSON.parse(line.substring(5));
-                if (
-                  jsonData.candidates &&
-                  jsonData.candidates[0] &&
-                  jsonData.candidates[0].finishReason
-                ) {
-                  // 实时更新最后看到的结束原因
+                if (jsonData.candidates?.[0]?.finishReason) {
                   finalFinishReason = jsonData.candidates[0].finishReason;
                 }
-              } catch (e) {
-                // 忽略JSON解析错误，因为有些心跳包可能不是标准JSON
-              }
+              } catch (e) {}
             }
           }
         }
 
         if (mode === "real") {
-          // 真流式：直接转发数据块
           this._transmitChunk(chunk, operationId);
         } else {
-          // 假流式：拼接成完整响应体
           fullBody += chunk;
         }
       }
 
-      // --- [核心修改] 流读取完成后，根据模式增加详细的诊断日志 ---
       Logger.output("数据流已读取完成。");
 
       if (mode === "real") {
-        // 真流式模式：基于流过程中记录的最后一个 finishReason 进行判断
         if (finalFinishReason === "STOP") {
           Logger.output(`✅ [诊断] 响应正常结束 (finishReason: STOP)`);
         } else {
@@ -408,13 +403,10 @@ class ProxySystem extends EventTarget {
           );
         }
       } else {
-        // 假流式模式：解析完整的响应体来判断
         try {
           const parsedBody = JSON.parse(fullBody);
-          // 尝试从响应体中获取 finishReason 和 safetyRatings
           const finishReason = parsedBody.candidates?.[0]?.finishReason;
           const safetyRatings = parsedBody.candidates?.[0]?.safetyRatings;
-
           if (finishReason === "STOP") {
             Logger.output(`✅ [诊断] 响应正常结束 (finishReason: STOP)`);
           } else {
@@ -427,22 +419,26 @@ class ProxySystem extends EventTarget {
               );
             }
           }
-          // 将完整的响应体转发给服务器
           this._transmitChunk(fullBody, operationId);
         } catch (e) {
           Logger.output(`⚠️ [诊断] 响应体不是有效的JSON格式，无法分析原因。`);
-          // 即使解析失败，也尝试转发原始响应体
           this._transmitChunk(fullBody, operationId);
         }
       }
 
-      // 发送流结束信号
       this._transmitStreamEnd(operationId);
     } catch (error) {
-      Logger.output(`❌ 请求处理失败: ${error.message}`);
-      if (error.name !== "AbortError") {
+      // 如果请求被中止，这里会捕获到 AbortError，打印日志即可
+      if (error.name === "AbortError") {
+        Logger.output(`[诊断] 操作 #${operationId} 的 fetch 请求已成功中止。`);
+      } else {
+        Logger.output(`❌ 请求处理失败: ${error.message}`);
         this._sendErrorResponse(error, operationId);
       }
+    } finally {
+      // 新增：无论成功、失败还是取消，最后都在这里清理，确保万无一失
+      this.requestProcessor.activeOperations.delete(operationId);
+      this.requestProcessor.cancelledOperations.delete(operationId);
     }
   }
 
