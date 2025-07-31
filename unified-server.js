@@ -752,20 +752,31 @@ class RequestHandler {
   }
 
   async processRequest(req, res) {
+    const requestId = this._generateRequestId(); // 提前生成ID，用于取消逻辑
+
+    // --- 核心优化：监听客户端连接关闭事件 ---
+    res.on("close", () => {
+      // 检查请求是否已经处理完毕。如果res.writableEnded为true，说明是正常结束，无需取消。
+      if (!res.writableEnded) {
+        this.logger.warn(
+          `[Request] 客户端已提前关闭请求 #${requestId} 的连接。`
+        );
+        this._cancelBrowserRequest(requestId);
+      }
+    });
+
     // 在处理任何请求之前，先检查浏览器连接是否健康
     if (!this.connectionRegistry.hasActiveConnections()) {
       this.logger.error(
         "❌ [System] 检测到浏览器WebSocket连接已断开！可能是进程崩溃。正在尝试恢复..."
       );
       try {
-        // 直接调用内部方法，使用当前账号索引尝试重启浏览器
         await this.browserManager.launchOrSwitchContext(this.currentAuthIndex);
         this.logger.info(
           `✅ [System] 浏览器已使用账号 #${this.currentAuthIndex} 成功恢复！`
         );
       } catch (error) {
         this.logger.error(`❌ [System] 浏览器自动恢复失败: ${error.message}`);
-        // 如果恢复失败，则返回错误，避免后续操作
         return this._sendErrorResponse(
           res,
           503,
@@ -773,38 +784,28 @@ class RequestHandler {
         );
       }
     }
-    // ======================= 新增：切换状态检查 =======================
-    // 1. 在处理任何事情之前，先检查是否有切换任务正在后台进行
+
     if (this.isAuthSwitching) {
       this.logger.warn(
         "[System] 收到新请求，但账号正在后台切换中，请稍后重试。"
       );
-      // 返回一个明确的错误，告知客户端服务器正忙
       return this._sendErrorResponse(
         res,
         503,
         "服务暂时不可用：正在切换账号，请在几秒钟后重试。"
       );
     }
-    // ===============================================================
-    // 1. 将用量计数和检查逻辑，从finally块移动到这里
-    // 确保在转发请求【之前】就完成计数和可能的切换
+
     if (this.config.switchOnUses > 0) {
-      // 只要有请求意图，就将这次“尝试”计入用量
       this.usageCount++;
       this.logger.info(
         `[Request] 账号轮换计数: ${this.usageCount}/${this.config.switchOnUses} (当前账号: ${this.currentAuthIndex})`
       );
-
-      // 检查用量是否【在本次使用后】达到或超过阈值
       if (this.usageCount >= this.config.switchOnUses) {
-        // 注意：这里的切换将会在本次请求处理完毕后在后台进行
-        // 我们先只记录一个标志，表明需要切换
         this.needsSwitchingAfterRequest = true;
       }
     }
 
-    const requestId = this._generateRequestId();
     const proxyRequest = this._buildProxyRequest(req, requestId);
     const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
 
@@ -824,9 +825,6 @@ class RequestHandler {
     } finally {
       this.connectionRegistry.removeMessageQueue(requestId);
 
-      // ======================= 核心修改：事后切换逻辑 =======================
-      // 2. 只有在本次请求成功完成后，才进行用量计数和切换检查
-      // 在请求的所有流程都结束后，检查是否需要执行后台切换
       if (this.needsSwitchingAfterRequest) {
         this.logger.info(
           `[Auth] 轮换计数已达到切换阈值 (${this.usageCount}/${this.config.switchOnUses})，将在后台自动切换账号...`
@@ -834,10 +832,30 @@ class RequestHandler {
         this._switchToNextAuth().catch((err) => {
           this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
         });
-        this.needsSwitchingAfterRequest = false; // 重置标志
+        this.needsSwitchingAfterRequest = false;
       }
     }
-  } // =====================================================================
+  }
+
+  // --- 新增一个辅助方法，用于发送取消指令 ---
+  _cancelBrowserRequest(requestId) {
+    const connection = this.connectionRegistry.getFirstConnection();
+    if (connection) {
+      this.logger.info(
+        `[Request] 正在向浏览器发送取消请求 #${requestId} 的指令...`
+      );
+      connection.send(
+        JSON.stringify({
+          event_type: "cancel_request",
+          request_id: requestId,
+        })
+      );
+    } else {
+      this.logger.warn(
+        `[Request] 无法发送取消指令：没有可用的浏览器WebSocket连接。`
+      );
+    }
+  }
 
   _generateRequestId() {
     return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
