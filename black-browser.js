@@ -335,31 +335,19 @@ class ProxySystem extends EventTarget {
     const mode = requestSpec.streaming_mode || "fake";
 
     try {
-      // 检查请求是否在执行前就已被取消（处理极端情况）
       if (this.requestProcessor.cancelledOperations.has(operationId)) {
-        Logger.output(
-          `[诊断] 请求 #${operationId} 在执行前已被取消，直接中止。`
-        );
-        // 主动向上抛出一个 AbortError，以统一处理流程
         throw new DOMException("The user aborted a request.", "AbortError");
       }
-
       const { responsePromise, cancelTimeout } = this.requestProcessor.execute(
         requestSpec,
         operationId
       );
-
       const response = await responsePromise;
-
       if (this.requestProcessor.cancelledOperations.has(operationId)) {
-        Logger.output(
-          `[诊断] 操作 #${operationId} 已被取消，响应结果将被丢弃。`
-        );
         throw new DOMException("The user aborted a request.", "AbortError");
       }
 
       this._transmitHeaders(response, operationId);
-
       const reader = response.body.getReader();
       const textDecoder = new TextDecoder();
       let timeoutCancelled = false;
@@ -374,8 +362,6 @@ class ProxySystem extends EventTarget {
           timeoutCancelled = true;
         }
         const chunk = textDecoder.decode(value, { stream: true });
-
-        // (内部解析逻辑保持不变)
         if (mode === "real") {
           const lines = chunk.split("\n");
           for (const line of lines) {
@@ -389,7 +375,6 @@ class ProxySystem extends EventTarget {
             }
           }
         }
-
         if (mode === "real") {
           this._transmitChunk(chunk, operationId);
         } else {
@@ -398,8 +383,6 @@ class ProxySystem extends EventTarget {
       }
 
       Logger.output("数据流已读取完成。");
-
-      // (诊断日志逻辑保持不变)
       if (mode === "real") {
         Logger.output(`✅ [诊断] 响应结束，原因: ${finalFinishReason}`);
       } else {
@@ -419,11 +402,15 @@ class ProxySystem extends EventTarget {
           this._transmitChunk(fullBody, operationId);
         }
       }
-
       this._transmitStreamEnd(operationId);
     } catch (error) {
-      Logger.output(`❌ 请求处理失败: ${error.message}`);
-      // --- 核心修改：无论是什么错误，特别是 AbortError，都要报告给服务器！ ---
+      // --- 核心修改：区分 AbortError 和其他错误 ---
+      if (error.name === "AbortError") {
+        Logger.output(`[诊断] 操作 #${operationId} 已被用户中止。`);
+      } else {
+        Logger.output(`❌ 请求处理失败: ${error.message}`);
+      }
+      // 无论如何，都需要将最终状态报告给服务器
       this._sendErrorResponse(error, operationId);
     } finally {
       this.requestProcessor.activeOperations.delete(operationId);
@@ -466,13 +453,16 @@ class ProxySystem extends EventTarget {
     this.connectionManager.transmit({
       request_id: operationId,
       event_type: "error",
-      // 关键修改：优先使用error对象上的status，如果没有则默认为504
       status: error.status || 504,
       message: `代理端浏览器错误: ${error.message || "未知错误"}`,
     });
-    Logger.output("已将错误信息发送回服务器");
+    // --- 核心修改：根据错误类型，使用不同的日志措辞 ---
+    if (error.name === 'AbortError') {
+        Logger.output("已将“中止”状态发送回服务器");
+    } else {
+        Logger.output("已将“错误”信息发送回服务器");
+    }
   }
-}
 
 async function initializeProxySystem() {
   // 清理旧的日志
