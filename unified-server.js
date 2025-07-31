@@ -752,11 +752,9 @@ class RequestHandler {
   }
 
   async processRequest(req, res) {
-    const requestId = this._generateRequestId(); // 提前生成ID，用于取消逻辑
+    const requestId = this._generateRequestId();
 
-    // --- 核心优化：监听客户端连接关闭事件 ---
     res.on("close", () => {
-      // 检查请求是否已经处理完毕。如果res.writableEnded为true，说明是正常结束，无需取消。
       if (!res.writableEnded) {
         this.logger.warn(
           `[Request] 客户端已提前关闭请求 #${requestId} 的连接。`
@@ -765,7 +763,6 @@ class RequestHandler {
       }
     });
 
-    // 在处理任何请求之前，先检查浏览器连接是否健康
     if (!this.connectionRegistry.hasActiveConnections()) {
       this.logger.error(
         "❌ [System] 检测到浏览器WebSocket连接已断开！可能是进程崩溃。正在尝试恢复..."
@@ -796,17 +793,27 @@ class RequestHandler {
       );
     }
 
-    if (this.config.switchOnUses > 0) {
+    // --- 核心修改：判断是否为生成请求 ---
+    const isGenerativeRequest =
+      req.method === "POST" &&
+      (req.path.includes("generateContent") ||
+        req.path.includes("streamGenerateContent"));
+
+    if (this.config.switchOnUses > 0 && isGenerativeRequest) {
       this.usageCount++;
       this.logger.info(
-        `[Request] 账号轮换计数: ${this.usageCount}/${this.config.switchOnUses} (当前账号: ${this.currentAuthIndex})`
+        `[Request] 生成请求 - 账号轮换计数: ${this.usageCount}/${this.config.switchOnUses} (当前账号: ${this.currentAuthIndex})`
       );
       if (this.usageCount >= this.config.switchOnUses) {
         this.needsSwitchingAfterRequest = true;
       }
     }
+    // --- 修改结束 ---
 
     const proxyRequest = this._buildProxyRequest(req, requestId);
+    // 我们将这个判断结果传递给后续方法
+    proxyRequest.is_generative = isGenerativeRequest;
+
     const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
 
     try {
@@ -824,7 +831,6 @@ class RequestHandler {
       this._handleRequestError(error, res);
     } finally {
       this.connectionRegistry.removeMessageQueue(requestId);
-
       if (this.needsSwitchingAfterRequest) {
         this.logger.info(
           `[Auth] 轮换计数已达到切换阈值 (${this.usageCount}/${this.config.switchOnUses})，将在后台自动切换账号...`
@@ -904,17 +910,13 @@ class RequestHandler {
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     });
-    this.logger.info("[Request] 已向客户端发送初始响应头，并启动Keep-Alive。");
-
-    const keepAliveChunk = this._getKeepAliveChunk(req);
     const connectionMaintainer = setInterval(() => {
-      if (!res.writableEnded) res.write(keepAliveChunk);
-    }, 10000);
+      if (!res.writableEnded) res.write(": keep-alive\n\n");
+    }, 15000);
 
     try {
       let lastMessage,
         requestFailed = false;
-
       for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
         if (attempt > 1) {
           this.logger.info(
@@ -922,7 +924,6 @@ class RequestHandler {
           );
         }
         this._forwardRequest(proxyRequest);
-
         try {
           const timeoutPromise = new Promise((_, reject) =>
             setTimeout(
@@ -945,7 +946,6 @@ class RequestHandler {
             message: timeoutError.message,
           };
         }
-
         if (lastMessage.event_type === "error") {
           this.logger.warn(
             `[Request] 尝试 #${attempt} 失败: 收到 ${
@@ -953,9 +953,6 @@ class RequestHandler {
             } 错误。 - ${lastMessage.message}`
           );
           if (attempt < this.maxRetries) {
-            const retryWaitText = `将在 ${this.retryDelay / 1000}秒后重试...`;
-            this.logger.warn(`[Request] ${retryWaitText}`);
-            this._sendErrorChunkToClient(res, `${errorText} ${retryWaitText}`);
             await new Promise((resolve) =>
               setTimeout(resolve, this.retryDelay)
             );
@@ -967,7 +964,6 @@ class RequestHandler {
       }
 
       if (requestFailed) {
-        // --- 核心修复：在这里区分“真失败”和“用户取消” ---
         if (
           lastMessage.message &&
           lastMessage.message.includes("The user aborted a request")
@@ -985,21 +981,20 @@ class RequestHandler {
             `请求最终失败: ${lastMessage.message}`
           );
         }
-        // 无论如何，处理完毕后都应返回，不再继续执行
         return;
       }
 
-      // --- 成功的逻辑 ---
-      if (this.failureCount > 0) {
+      // --- 核心修改：只有在生成请求成功时，才重置失败计数 ---
+      if (proxyRequest.is_generative && this.failureCount > 0) {
         this.logger.info(
-          `✅ [Auth] 请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
+          `✅ [Auth] 生成请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
         );
         this.failureCount = 0;
       }
+      // --- 修改结束 ---
 
       const dataMessage = await messageQueue.dequeue();
       const endMessage = await messageQueue.dequeue();
-
       if (dataMessage.data) {
         try {
           const fullResponse = JSON.parse(dataMessage.data);
@@ -1042,18 +1037,18 @@ class RequestHandler {
       if (!res.writableEnded) {
         res.end();
       }
-      this.logger.info("[Request] 假流式响应处理结束。");
+      this.logger.info(
+        `[Request] 假流式响应处理结束，请求ID: ${proxyRequest.request_id}`
+      );
     }
   }
 
   async _handleRealStreamResponse(proxyRequest, messageQueue, res) {
     this.logger.info(`[Request] 请求已派发给浏览器端处理...`);
     this._forwardRequest(proxyRequest);
-
     const headerMessage = await messageQueue.dequeue();
 
     if (headerMessage.event_type === "error") {
-      // --- 核心修复：在这里区分“真失败”和“用户取消” ---
       if (
         headerMessage.message &&
         headerMessage.message.includes("The user aborted a request")
@@ -1070,20 +1065,20 @@ class RequestHandler {
           headerMessage.message
         );
       }
-      // 对于已取消的请求，如果头未发送，也应正常关闭
       if (!res.writableEnded) res.end();
       return;
     }
 
-    // --- 成功的逻辑 ---
-    if (this.failureCount > 0) {
+    // --- 核心修改：只有在生成请求成功时，才重置失败计数 ---
+    if (proxyRequest.is_generative && this.failureCount > 0) {
       this.logger.info(
-        `✅ [Auth] 请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
+        `✅ [Auth] 生成请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
       );
       this.failureCount = 0;
     }
-    this._setResponseHeaders(res, headerMessage);
+    // --- 修改结束 ---
 
+    this._setResponseHeaders(res, headerMessage);
     this.logger.info("[Request] 已向客户端发送真实响应头，开始流式传输...");
     try {
       while (true) {
@@ -1099,7 +1094,9 @@ class RequestHandler {
       this.logger.warn("[Request] 真流式响应超时，可能流已正常结束。");
     } finally {
       if (!res.writableEnded) res.end();
-      this.logger.info("[Request] 真流式响应连接已关闭。");
+      this.logger.info(
+        `[Request] 真流式响应连接已关闭，请求ID: ${proxyRequest.request_id}`
+      );
     }
   }
 
