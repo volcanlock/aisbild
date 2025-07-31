@@ -335,6 +335,15 @@ class ProxySystem extends EventTarget {
     const mode = requestSpec.streaming_mode || "fake";
 
     try {
+      // 检查请求是否在执行前就已被取消（处理极端情况）
+      if (this.requestProcessor.cancelledOperations.has(operationId)) {
+        Logger.output(
+          `[诊断] 请求 #${operationId} 在执行前已被取消，直接中止。`
+        );
+        // 主动向上抛出一个 AbortError，以统一处理流程
+        throw new DOMException("The user aborted a request.", "AbortError");
+      }
+
       const { responsePromise, cancelTimeout } = this.requestProcessor.execute(
         requestSpec,
         operationId
@@ -342,16 +351,12 @@ class ProxySystem extends EventTarget {
 
       const response = await responsePromise;
 
-      // ======================= 核心防御逻辑 =======================
-      // 检查这个操作ID是否在我们等待期间被加入了“取消黑名单”
       if (this.requestProcessor.cancelledOperations.has(operationId)) {
         Logger.output(
           `[诊断] 操作 #${operationId} 已被取消，响应结果将被丢弃。`
         );
-        // 无需做任何事，直接在 finally 中清理后退出
-        return;
+        throw new DOMException("The user aborted a request.", "AbortError");
       }
-      // ==========================================================
 
       this._transmitHeaders(response, operationId);
 
@@ -359,7 +364,6 @@ class ProxySystem extends EventTarget {
       const textDecoder = new TextDecoder();
       let timeoutCancelled = false;
       let fullBody = "";
-
       let finalFinishReason = "UNKNOWN";
 
       while (true) {
@@ -371,6 +375,7 @@ class ProxySystem extends EventTarget {
         }
         const chunk = textDecoder.decode(value, { stream: true });
 
+        // (内部解析逻辑保持不变)
         if (mode === "real") {
           const lines = chunk.split("\n");
           for (const line of lines) {
@@ -394,49 +399,33 @@ class ProxySystem extends EventTarget {
 
       Logger.output("数据流已读取完成。");
 
+      // (诊断日志逻辑保持不变)
       if (mode === "real") {
-        if (finalFinishReason === "STOP") {
-          Logger.output(`✅ [诊断] 响应正常结束 (finishReason: STOP)`);
-        } else {
-          Logger.output(
-            `🤔 [诊断] 响应可能被截断，结束原因为: ${finalFinishReason}`
-          );
-        }
+        Logger.output(`✅ [诊断] 响应结束，原因: ${finalFinishReason}`);
       } else {
         try {
           const parsedBody = JSON.parse(fullBody);
           const finishReason = parsedBody.candidates?.[0]?.finishReason;
           const safetyRatings = parsedBody.candidates?.[0]?.safetyRatings;
-          if (finishReason === "STOP") {
-            Logger.output(`✅ [诊断] 响应正常结束 (finishReason: STOP)`);
-          } else {
+          Logger.output(`✅ [诊断] 响应结束，原因: ${finishReason || "未知"}`);
+          if (safetyRatings) {
             Logger.output(
-              `🤔 [诊断] 响应可能被截断，结束原因为: ${finishReason || "未知"}`
+              `[诊断] 安全评级详情: ${JSON.stringify(safetyRatings)}`
             );
-            if (safetyRatings) {
-              Logger.output(
-                `[诊断] 安全评级详情: ${JSON.stringify(safetyRatings)}`
-              );
-            }
           }
           this._transmitChunk(fullBody, operationId);
         } catch (e) {
-          Logger.output(`⚠️ [诊断] 响应体不是有效的JSON格式，无法分析原因。`);
+          Logger.output(`⚠️ [诊断] 响应体不是有效的JSON格式。`);
           this._transmitChunk(fullBody, operationId);
         }
       }
 
       this._transmitStreamEnd(operationId);
     } catch (error) {
-      // 如果请求被中止，这里会捕获到 AbortError，打印日志即可
-      if (error.name === "AbortError") {
-        Logger.output(`[诊断] 操作 #${operationId} 的 fetch 请求已成功中止。`);
-      } else {
-        Logger.output(`❌ 请求处理失败: ${error.message}`);
-        this._sendErrorResponse(error, operationId);
-      }
+      Logger.output(`❌ 请求处理失败: ${error.message}`);
+      // --- 核心修改：无论是什么错误，特别是 AbortError，都要报告给服务器！ ---
+      this._sendErrorResponse(error, operationId);
     } finally {
-      // 新增：无论成功、失败还是取消，最后都在这里清理，确保万无一失
       this.requestProcessor.activeOperations.delete(operationId);
       this.requestProcessor.cancelledOperations.delete(operationId);
     }
