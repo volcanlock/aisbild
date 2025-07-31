@@ -164,9 +164,9 @@ class BrowserManager {
     this.logger = logger;
     this.config = config;
     this.authSource = authSource;
-    this.browser = null;
-    this.context = null;
-    this.page = null;
+    this.browser = null; // 浏览器实例，在服务生命周期内只启动一次
+    this.context = null; // 浏览器上下文，每次切换账号时会更换
+    this.page = null; // 页面，随上下文一起更换
     this.currentAuthIndex = 0;
     this.scriptFileName = "black-browser.js";
 
@@ -202,30 +202,60 @@ class BrowserManager {
     }
   }
 
-  async launchBrowser(authIndex) {
-    if (this.browser) {
-      this.logger.warn("尝试启动一个已在运行的浏览器实例，操作已取消。");
-      return;
+  // 重要：原 launchBrowser 方法已被替换为 launchOrSwitchContext
+  // 这个方法现在负责：1. 如果浏览器没启动，则启动它。 2. 为指定账号创建全新的、隔离的上下文环境。
+  async launchOrSwitchContext(authIndex) {
+    // 1. 如果浏览器实例不存在，则进行首次启动
+    if (!this.browser) {
+      this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动...");
+
+      if (!fs.existsSync(this.browserExecutablePath)) {
+        this.logger.error(
+          `❌ [Browser] 找不到浏览器可执行文件: ${this.browserExecutablePath}`
+        );
+        throw new Error(
+          `Browser executable not found at path: ${this.browserExecutablePath}`
+        );
+      }
+
+      this.browser = await firefox.launch({
+        headless: true,
+        executablePath: this.browserExecutablePath,
+      });
+
+      this.browser.on("disconnected", () => {
+        this.logger.error(
+          "❌ [Browser] 浏览器意外断开连接！服务可能需要重启。"
+        );
+        this.browser = null; // 标记为已关闭，下次请求会尝试恢复
+        this.context = null;
+        this.page = null;
+      });
+      this.logger.info(
+        "✅ [Browser] 浏览器实例已成功启动，并将在服务生命周期内保持运行。"
+      );
     }
 
+    // 2. 如果已存在一个旧的上下文，先优雅地关闭它
+    if (this.context) {
+      this.logger.info("[Browser] 正在关闭旧的浏览器上下文...");
+      await this.context.close();
+      this.context = null;
+      this.page = null;
+      this.logger.info("[Browser] 旧上下文已关闭。");
+    }
+
+    // 3. 开始为新账号创建全新的上下文
     const sourceDescription =
       this.authSource.authMode === "env"
         ? `环境变量 AUTH_JSON_${authIndex}`
         : `文件 auth-${authIndex}.json`;
     this.logger.info("==================================================");
-    this.logger.info(`🚀 [Browser] 准备启动浏览器`);
+    this.logger.info(
+      `🔄 [Browser] 正在为账号 #${authIndex} 创建新的浏览器上下文`
+    );
     this.logger.info(`   • 认证源: ${sourceDescription}`);
-    this.logger.info(`   • 浏览器路径: ${this.browserExecutablePath}`);
     this.logger.info("==================================================");
-
-    if (!fs.existsSync(this.browserExecutablePath)) {
-      this.logger.error(
-        `❌ [Browser] 找不到浏览器可执行文件: ${this.browserExecutablePath}`
-      );
-      throw new Error(
-        `Browser executable not found at path: ${this.browserExecutablePath}`
-      );
-    }
 
     const storageStateObject = this.authSource.getAuth(authIndex);
     if (!storageStateObject) {
@@ -244,13 +274,11 @@ class BrowserManager {
       const validSameSiteValues = ["Lax", "Strict", "None"];
 
       storageStateObject.cookies.forEach((cookie) => {
-        // 检查 sameSite 的值是否在有效列表里
         if (!validSameSiteValues.includes(cookie.sameSite)) {
-          // 如果无效 (比如是小写的 'lax', 空值, 或不存在), 则自动修正
           this.logger.warn(
             `[Auth] 发现无效的 Cookie sameSite 值: '${cookie.sameSite}'，正在自动修正为 'None'。`
           );
-          cookie.sameSite = "None"; // 'None' 通常对于跨站嵌入的场景兼容性最好
+          cookie.sameSite = "None";
           fixedCount++;
         }
       });
@@ -276,43 +304,30 @@ class BrowserManager {
     }
 
     try {
-      this.browser = await firefox.launch({
-        headless: true,
-        executablePath: this.browserExecutablePath,
-      });
-      this.browser.on("disconnected", () => {
-        this.logger.error(
-          "❌ [Browser] 浏览器意外断开连接！服务器可能需要重启。"
-        );
-        this.browser = null;
-        this.context = null;
-        this.page = null;
-      });
+      // 4. 使用浏览器实例创建新的上下文
       this.context = await this.browser.newContext({
         storageState: storageStateObject,
         viewport: { width: 1920, height: 1080 },
       });
       this.page = await this.context.newPage();
+
+      // 5. 接下来的所有逻辑和原来完全一样
       this.page.on("console", (msg) => {
-        const msgType = msg.type(); // 获取消息类型，如 'log', 'warn', 'error'
+        const msgType = msg.type();
         const msgText = msg.text();
 
-        // 核心过滤条件：我们只关心自己脚本产生的日志，它们的标志是包含"[ProxyClient]"
         if (msgText.includes("[ProxyClient]")) {
-          // 为了美观，去掉浏览器脚本里的前缀，使用服务器的统一格式
           const cleanMsg = msgText.replace("[ProxyClient] ", "");
-          // 根据浏览器日志的原始类型，决定在服务器上用什么级别打印
           if (msgType === "error" || msgType === "warn") {
-            this.logger.warn(`[Browser] ${cleanMsg}`); // 用 WARN 级别打印浏览器的错误和警告
+            this.logger.warn(`[Browser] ${cleanMsg}`);
           } else {
-            this.logger.info(`[Browser] ${cleanMsg}`); // 用 INFO 级别打印常规日志
+            this.logger.info(`[Browser] ${cleanMsg}`);
           }
-        }
-        // 备用逻辑：如果一条消息不含我们的前缀，但它是一个错误(error)，我们可能也想看到它，以防页面本身崩溃
-        else if (msgType === "error") {
+        } else if (msgType === "error") {
           this.logger.error(`[Browser Page Error] ${msgText}`);
         }
       });
+
       this.logger.info(`[Browser] 正在加载账户 ${authIndex} 并访问目标网页...`);
       const targetUrl =
         "https://aistudio.google.com/u/0/apps/bundled/blank?showPreview=true&showCode=true&showAssistant=true";
@@ -320,16 +335,14 @@ class BrowserManager {
         timeout: 60000,
         waitUntil: "networkidle",
       });
+
       this.logger.info("[Browser] 检查登录状态...");
-      // 尝试寻找一个只有在未登录时才会出现的元素，例如“Sign in”按钮
-      // 注意：这里的选择器可能需要根据AI Studio页面的更新而调整
       const signInButton = this.page.locator(
         'a[href^="https://accounts.google.com/"]'
       );
       const isSignedIn = (await signInButton.count()) === 0;
 
       if (!isSignedIn) {
-        // 如果找到了登录按钮，说明cookie无效，立即抛出错误
         throw new Error("Cookie无效或已过期，页面未处于登录状态。");
       }
       this.logger.info("[Browser] ✅ 登录状态正常。");
@@ -347,8 +360,8 @@ class BrowserManager {
       this.logger.info("[Browser] 编辑器已出现，准备粘贴脚本。");
 
       this.logger.info("[Browser] 暂停3秒并模拟点击以确保页面激活...");
-      await this.page.waitForTimeout(3000); // 无条件等待3秒
-      await editorContainerLocator.click({ timeout: 60000 }); // 再次点击编辑器，确保它是焦点
+      await this.page.waitForTimeout(3000);
+      await editorContainerLocator.click({ timeout: 60000 });
 
       await editorContainerLocator.click();
       await this.page.evaluate(
@@ -362,13 +375,14 @@ class BrowserManager {
 
       this.currentAuthIndex = authIndex;
       this.logger.info("==================================================");
-      this.logger.info(`✅ [Browser] 账户 ${authIndex} 初始化成功！`);
+      this.logger.info(`✅ [Browser] 账户 ${authIndex} 的上下文初始化成功！`);
       this.logger.info("✅ [Browser] 浏览器客户端已准备就绪。");
       this.logger.info("==================================================");
     } catch (error) {
       this.logger.error(
-        `❌ [Browser] 账户 ${authIndex} 初始化失败: ${error.message}`
+        `❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`
       );
+      // 如果创建上下文失败，可能是严重问题，选择关闭整个浏览器以触发恢复机制
       if (this.browser) {
         await this.browser.close();
         this.browser = null;
@@ -377,23 +391,25 @@ class BrowserManager {
     }
   }
 
+  // closeBrowser 现在只用于服务关闭或严重错误后的彻底清理
   async closeBrowser() {
     if (this.browser) {
-      this.logger.info("[Browser] 正在关闭当前浏览器实例...");
+      this.logger.info("[Browser] 正在关闭整个浏览器实例...");
       await this.browser.close();
       this.browser = null;
       this.context = null;
       this.page = null;
-      this.logger.info("[Browser] 浏览器已关闭。");
+      this.logger.info("[Browser] 浏览器实例已关闭。");
     }
   }
 
+  // switchAccount 现在的逻辑变得非常简单和高效
   async switchAccount(newAuthIndex) {
     this.logger.info(
       `🔄 [Browser] 开始账号切换: 从 ${this.currentAuthIndex} 到 ${newAuthIndex}`
     );
-    await this.closeBrowser();
-    await this.launchBrowser(newAuthIndex);
+    // 直接调用新的上下文切换方法，而不是重启浏览器
+    await this.launchOrSwitchContext(newAuthIndex);
     this.logger.info(
       `✅ [Browser] 账号切换完成，当前账号: ${this.currentAuthIndex}`
     );
@@ -654,7 +670,7 @@ class RequestHandler {
         `🚨 [Auth] 切换失败，正在尝试回退到上一个可用账号 #${previousAuthIndex}...`
       );
       try {
-        await this.browserManager.launchBrowser(previousAuthIndex);
+        await this.browserManager.launchOrSwitchContext(previousAuthIndex);
         this.logger.info(`✅ [Auth] 成功回退到账号 #${previousAuthIndex}！`);
         this.failureCount = 0;
         this.usageCount = 0;
@@ -743,7 +759,7 @@ class RequestHandler {
       );
       try {
         // 直接调用内部方法，使用当前账号索引尝试重启浏览器
-        await this.browserManager.launchBrowser(this.currentAuthIndex);
+        await this.browserManager.launchOrSwitchContext(this.currentAuthIndex);
         this.logger.info(
           `✅ [System] 浏览器已使用账号 #${this.currentAuthIndex} 成功恢复！`
         );
@@ -1261,7 +1277,7 @@ class ProxyServerSystem extends EventEmitter {
     for (const index of startupOrder) {
       try {
         this.logger.info(`[System] 尝试使用账号 #${index} 启动服务...`);
-        await this.browserManager.launchBrowser(index);
+        await this.browserManager.launchOrSwitchContext(index);
 
         isStarted = true;
         this.logger.info(`[System] ✅ 使用账号 #${index} 成功启动！`);
