@@ -322,14 +322,14 @@ class ProxySystem extends EventTarget {
       let timeoutCancelled = false;
       let fullBody = ""; // 用于假流式模式
 
-      // [新增] 用于记录最终结束原因的变量
+      // [新增] 用于在流式模式下记录最终结束原因的变量
       let finalFinishReason = "UNKNOWN";
 
       while (true) {
         const { done, value } = await reader.read();
 
         if (done) {
-          break;
+          break; // 流已结束
         }
 
         if (!timeoutCancelled) {
@@ -339,7 +339,7 @@ class ProxySystem extends EventTarget {
 
         const chunk = textDecoder.decode(value, { stream: true });
 
-        // [新增] 在每个数据块中解析和记录 finishReason
+        // [新增逻辑] 如果是真流式，实时解析每个数据块以捕获最后的 finishReason
         if (mode === "real") {
           const lines = chunk.split("\n");
           for (const line of lines) {
@@ -348,59 +348,74 @@ class ProxySystem extends EventTarget {
                 const jsonData = JSON.parse(line.substring(5));
                 if (
                   jsonData.candidates &&
+                  jsonData.candidates[0] &&
                   jsonData.candidates[0].finishReason
                 ) {
+                  // 实时更新最后看到的结束原因
                   finalFinishReason = jsonData.candidates[0].finishReason;
                 }
               } catch (e) {
-                /* 忽略JSON解析错误 */
+                // 忽略JSON解析错误，因为有些心跳包可能不是标准JSON
               }
             }
           }
         }
 
         if (mode === "real") {
+          // 真流式：直接转发数据块
           this._transmitChunk(chunk, operationId);
         } else {
+          // 假流式：拼接成完整响应体
           fullBody += chunk;
         }
       }
 
-      // --- [新增] 流结束后，根据模式输出最终状态日志 ---
-      Logger.output("流读取完成。");
+      // --- [核心修改] 流读取完成后，根据模式增加详细的诊断日志 ---
+      Logger.output("数据流已读取完成。");
 
       if (mode === "real") {
-        // 真流式模式：基于流过程中记录的最后一个 finishReason 判断
+        // 真流式模式：基于流过程中记录的最后一个 finishReason 进行判断
         if (finalFinishReason === "STOP") {
-          Logger.output("✅ 响应成功");
+          Logger.output(`✅ [诊断] 响应正常结束 (finishReason: STOP)`);
         } else {
-          Logger.output(`🤔 响应结束异常，原因: ${finalFinishReason}`);
+          Logger.output(
+            `🤔 [诊断] 响应可能被截断，结束原因为: ${finalFinishReason}`
+          );
         }
       } else {
         // 假流式模式：解析完整的响应体来判断
-        let logMessage;
         try {
           const parsedBody = JSON.parse(fullBody);
+          // 尝试从响应体中获取 finishReason 和 safetyRatings
           const finishReason = parsedBody.candidates?.[0]?.finishReason;
+          const safetyRatings = parsedBody.candidates?.[0]?.safetyRatings;
 
           if (finishReason === "STOP") {
-            logMessage = "✅ 响应成功";
+            Logger.output(`✅ [诊断] 响应正常结束 (finishReason: STOP)`);
           } else {
-            logMessage = `🤔 响应结束异常，原因: ${finishReason || "未知"}`;
+            Logger.output(
+              `🤔 [诊断] 响应可能被截断，结束原因为: ${finishReason || "未知"}`
+            );
+            if (safetyRatings) {
+              Logger.output(
+                `[诊断] 安全评级详情: ${JSON.stringify(safetyRatings)}`
+              );
+            }
           }
+          // 将完整的响应体转发给服务器
+          this._transmitChunk(fullBody, operationId);
         } catch (e) {
-          logMessage = `⚠️ 响应非JSON格式`;
+          Logger.output(`⚠️ [诊断] 响应体不是有效的JSON格式，无法分析原因。`);
+          // 即使解析失败，也尝试转发原始响应体
+          this._transmitChunk(fullBody, operationId);
         }
-        Logger.output(logMessage);
-        this._transmitChunk(fullBody, operationId);
       }
 
+      // 发送流结束信号
       this._transmitStreamEnd(operationId);
     } catch (error) {
-      Logger.output(`❌ 错误: ${error.message}`);
+      Logger.output(`❌ 请求处理失败: ${error.message}`);
       if (error.name !== "AbortError") {
-        this._sendErrorResponse(error, operationId);
-      } else {
         this._sendErrorResponse(error, operationId);
       }
     }
