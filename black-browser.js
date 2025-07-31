@@ -255,6 +255,14 @@ class RequestProcessor {
     ].forEach((h) => delete sanitized[h]);
     return sanitized;
   }
+  cancelOperation(operationId) {
+    const controller = this.activeOperations.get(operationId);
+    if (controller) {
+      Logger.output(`收到取消指令，正在中止操作 #${operationId}...`);
+      controller.abort(); // 中止与此操作关联的 fetch 请求
+      this.activeOperations.delete(operationId); // 从活动列表中移除
+    }
+  }
 }
 
 class ProxySystem extends EventTarget {
@@ -291,15 +299,32 @@ class ProxySystem extends EventTarget {
     let requestSpec = {};
     try {
       requestSpec = JSON.parse(messageData);
-      Logger.output(
-        `收到请求: ${requestSpec.method} ${requestSpec.path} (模式: ${
-          requestSpec.streaming_mode || "fake"
-        })`
-      );
-      await this._processProxyRequest(requestSpec);
+
+      // --- 核心修改：根据 event_type 分发任务 ---
+      switch (requestSpec.event_type) {
+        case "cancel_request":
+          // 如果是取消指令，则调用取消方法
+          this.requestProcessor.cancelOperation(requestSpec.request_id);
+          break;
+        default:
+          // 默认情况，认为是代理请求
+          Logger.output(
+            `收到请求: ${requestSpec.method} ${requestSpec.path} (模式: ${
+              requestSpec.streaming_mode || "fake"
+            })`
+          );
+          await this._processProxyRequest(requestSpec);
+          break;
+      }
     } catch (error) {
       Logger.output("消息处理错误:", error.message);
-      this._sendErrorResponse(error, requestSpec.request_id);
+      // 只有在代理请求处理中出错时才发送错误响应
+      if (
+        requestSpec.request_id &&
+        requestSpec.event_type !== "cancel_request"
+      ) {
+        this._sendErrorResponse(error, requestSpec.request_id);
+      }
     }
   }
 
