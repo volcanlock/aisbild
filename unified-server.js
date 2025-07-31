@@ -923,9 +923,7 @@ class RequestHandler {
         }
         this._forwardRequest(proxyRequest);
 
-        // --- 关键修改在这里 ---
         try {
-          // 创建一个超时Promise，比如90秒
           const timeoutPromise = new Promise((_, reject) =>
             setTimeout(
               () =>
@@ -935,13 +933,11 @@ class RequestHandler {
               300000
             )
           );
-          // 让“等待消息”和“超时”进行赛跑
           lastMessage = await Promise.race([
             messageQueue.dequeue(),
             timeoutPromise,
           ]);
         } catch (timeoutError) {
-          // 如果是超时错误，就把它当作一个普通的浏览器错误来处理
           this.logger.error(`[Request] 致命错误: ${timeoutError.message}`);
           lastMessage = {
             event_type: "error",
@@ -949,14 +945,13 @@ class RequestHandler {
             message: timeoutError.message,
           };
         }
-        // --- 修改结束 ---
 
         if (lastMessage.event_type === "error") {
-          const errorText = `收到 ${lastMessage.status || "未知"} 错误。`;
           this.logger.warn(
-            `[Request] 尝试 #${attempt} 失败: ${errorText} - ${lastMessage.message}`
+            `[Request] 尝试 #${attempt} 失败: 收到 ${
+              lastMessage.status || "未知"
+            } 错误。 - ${lastMessage.message}`
           );
-
           if (attempt < this.maxRetries) {
             const retryWaitText = `将在 ${this.retryDelay / 1000}秒后重试...`;
             this.logger.warn(`[Request] ${retryWaitText}`);
@@ -972,27 +967,40 @@ class RequestHandler {
       }
 
       if (requestFailed) {
-        this.logger.error(`[Request] 所有 ${this.maxRetries} 次重试均失败。`);
-        await this._handleRequestFailureAndSwitch(lastMessage, res);
-        this._sendErrorChunkToClient(
-          res,
-          `请求最终失败: ${lastMessage.message}`
-        );
+        // --- 核心修复：在这里区分“真失败”和“用户取消” ---
+        if (
+          lastMessage.message &&
+          lastMessage.message.includes("The user aborted a request")
+        ) {
+          this.logger.info(
+            `[Request] 请求 #${proxyRequest.request_id} 已被用户妥善取消，不计入失败统计。`
+          );
+        } else {
+          this.logger.error(
+            `[Request] 所有 ${this.maxRetries} 次重试均失败，将计入失败统计。`
+          );
+          await this._handleRequestFailureAndSwitch(lastMessage, res);
+          this._sendErrorChunkToClient(
+            res,
+            `请求最终失败: ${lastMessage.message}`
+          );
+        }
+        // 无论如何，处理完毕后都应返回，不再继续执行
         return;
       }
 
+      // --- 成功的逻辑 ---
       if (this.failureCount > 0) {
         this.logger.info(
           `✅ [Auth] 请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
         );
+        this.failureCount = 0;
       }
-      this.failureCount = 0;
 
       const dataMessage = await messageQueue.dequeue();
       const endMessage = await messageQueue.dequeue();
 
       if (dataMessage.data) {
-        // --- 保留我们新增的日志诊断代码 ---
         try {
           const fullResponse = JSON.parse(dataMessage.data);
           if (
@@ -1020,11 +1028,7 @@ class RequestHandler {
               }
             });
           }
-        } catch (e) {
-          // 如果解析失败，说明data字段只是纯文本或格式不符，忽略即可
-        }
-        // --- 日志诊断代码结束 ---
-
+        } catch (e) {}
         res.write(`data: ${dataMessage.data}\n\n`);
       }
       if (endMessage.type !== "STREAM_END") {
@@ -1043,30 +1047,41 @@ class RequestHandler {
   }
 
   async _handleRealStreamResponse(proxyRequest, messageQueue, res) {
-    // 发出请求，不再有服务器端的for循环重试
     this.logger.info(`[Request] 请求已派发给浏览器端处理...`);
     this._forwardRequest(proxyRequest);
 
-    // 直接等待浏览器端的最终结果
     const headerMessage = await messageQueue.dequeue();
 
-    // 如果浏览器直接返回错误
     if (headerMessage.event_type === "error") {
-      await this._handleRequestFailureAndSwitch(headerMessage, null);
-      return this._sendErrorResponse(
-        res,
-        headerMessage.status,
-        headerMessage.message
-      );
+      // --- 核心修复：在这里区分“真失败”和“用户取消” ---
+      if (
+        headerMessage.message &&
+        headerMessage.message.includes("The user aborted a request")
+      ) {
+        this.logger.info(
+          `[Request] 请求 #${proxyRequest.request_id} 已被用户妥善取消，不计入失败统计。`
+        );
+      } else {
+        this.logger.error(`[Request] 请求失败，将计入失败统计。`);
+        await this._handleRequestFailureAndSwitch(headerMessage, null);
+        return this._sendErrorResponse(
+          res,
+          headerMessage.status,
+          headerMessage.message
+        );
+      }
+      // 对于已取消的请求，如果头未发送，也应正常关闭
+      if (!res.writableEnded) res.end();
+      return;
     }
 
-    // 正常处理成功的响应
+    // --- 成功的逻辑 ---
     if (this.failureCount > 0) {
       this.logger.info(
         `✅ [Auth] 请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
       );
+      this.failureCount = 0;
     }
-    this.failureCount = 0;
     this._setResponseHeaders(res, headerMessage);
 
     this.logger.info("[Request] 已向客户端发送真实响应头，开始流式传输...");
@@ -1451,7 +1466,16 @@ class ProxyServerSystem extends EventEmitter {
   _createExpressApp() {
     const app = express();
     app.use((req, res, next) => {
-      this.logger.info(`[Entrypoint] 收到一个请求: ${req.method} ${req.path}`);
+      // 如果请求路径不是下面这几个，才打印日志
+      if (
+        req.path !== "/api/status" &&
+        req.path !== "/" &&
+        req.path !== "/favicon.ico"
+      ) {
+        this.logger.info(
+          `[Entrypoint] 收到一个请求: ${req.method} ${req.path}`
+        );
+      }
       next();
     });
     const basicAuth = require("basic-auth");
