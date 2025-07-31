@@ -510,8 +510,17 @@ class ConnectionRegistry extends EventEmitter {
     this.logger = logger;
     this.connections = new Set();
     this.messageQueues = new Map();
+    this.reconnectGraceTimer = null; // 新增：用于缓冲期计时的定时器
   }
   addConnection(websocket, clientInfo) {
+    // --- 核心修改：当新连接建立时，清除可能存在的“断开”警报 ---
+    if (this.reconnectGraceTimer) {
+      clearTimeout(this.reconnectGraceTimer);
+      this.reconnectGraceTimer = null;
+      this.logger.info("[Server] 在缓冲期内检测到新连接，已取消断开处理。");
+    }
+    // --- 修改结束 ---
+
     this.connections.add(websocket);
     this.logger.info(
       `[Server] 内部WebSocket客户端已连接 (来自: ${clientInfo.address})`
@@ -525,13 +534,27 @@ class ConnectionRegistry extends EventEmitter {
     );
     this.emit("connectionAdded", websocket);
   }
+
   _removeConnection(websocket) {
     this.connections.delete(websocket);
-    this.logger.warn("[Server] 内部WebSocket客户端连接断开");
-    this.messageQueues.forEach((queue) => queue.close());
-    this.messageQueues.clear();
+    this.logger.warn("[Server] 内部WebSocket客户端连接断开。");
+
+    // --- 核心修改：不立即清理队列，而是启动一个缓冲期 ---
+    this.logger.info("[Server] 启动5秒重连缓冲期...");
+    this.reconnectGraceTimer = setTimeout(() => {
+      // 5秒后，如果没有新连接进来（即reconnectGraceTimer未被清除），则确认是真实断开
+      this.logger.error(
+        "[Server] 缓冲期结束，未检测到重连。确认连接丢失，正在清理所有待处理请求..."
+      );
+      this.messageQueues.forEach((queue) => queue.close());
+      this.messageQueues.clear();
+      this.emit("connectionLost"); // 使用一个新的事件名，表示确认丢失
+    }, 5000); // 5秒的缓冲时间
+    // --- 修改结束 ---
+
     this.emit("connectionRemoved", websocket);
   }
+
   _handleIncomingMessage(messageData) {
     try {
       const parsedMessage = JSON.parse(messageData);
@@ -544,12 +567,16 @@ class ConnectionRegistry extends EventEmitter {
       if (queue) {
         this._routeMessage(parsedMessage, queue);
       } else {
-        this.logger.warn(`[Server] 收到未知请求ID的消息: ${requestId}`);
+        // 在缓冲期内，旧的请求队列可能仍然存在，但连接已经改变，这可能会导致找不到队列。
+        // 暂时只记录警告，避免因竞速条件而报错。
+        this.logger.warn(`[Server] 收到未知或已过时请求ID的消息: ${requestId}`);
       }
     } catch (error) {
       this.logger.error("[Server] 解析内部WebSocket消息失败");
     }
   }
+
+  // 其他方法 (_routeMessage, hasActiveConnections, getFirstConnection,等) 保持不变...
   _routeMessage(message, queue) {
     const { event_type } = message;
     switch (event_type) {
@@ -640,8 +667,8 @@ class RequestHandler {
     }
 
     if (this.isAuthSwitching) {
-      this.logger.info("🔄 [Auth] 正在切换auth文件，跳过重复切换");
-      return { success: false, reason: "Switch already in progress." }; // 返回一个状态
+      this.logger.info("🔄 [Auth] 正在切换账号，跳过重复操作");
+      return { success: false, reason: "Switch already in progress." };
     }
 
     this.isAuthSwitching = true;
@@ -658,10 +685,11 @@ class RequestHandler {
       await this.browserManager.switchAccount(nextAuthIndex);
       this.failureCount = 0;
       this.usageCount = 0;
-      this.logger.info(`✅ [Auth] 成功切换到账号 #${this.currentAuthIndex}`);
-      // ...
+      this.logger.info(
+        `✅ [Auth] 成功切换到账号 #${this.currentAuthIndex}，计数已重置。`
+      );
       this.isAuthSwitching = false;
-      return { success: true, newIndex: this.currentAuthIndex }; // 返回成功状态
+      return { success: true, newIndex: this.currentAuthIndex };
     } catch (error) {
       this.logger.error(
         `❌ [Auth] 切换到账号 #${nextAuthIndex} 失败: ${error.message}`
@@ -672,22 +700,25 @@ class RequestHandler {
       try {
         await this.browserManager.launchOrSwitchContext(previousAuthIndex);
         this.logger.info(`✅ [Auth] 成功回退到账号 #${previousAuthIndex}！`);
+
+        // --- 核心修复：在这里重置计数器！ ---
         this.failureCount = 0;
         this.usageCount = 0;
         this.logger.info("[Auth] 失败和使用计数已在回退成功后重置为0。");
+        // --- 修复结束 ---
+
         this.isAuthSwitching = false;
         return {
           success: false,
           fallback: true,
           newIndex: this.currentAuthIndex,
-        }; // 返回回退成功状态
+        };
       } catch (fallbackError) {
         this.logger.error(
-          `FATAL: ❌❌❌ [Auth] 紧急回退到账号 #${previousAuthIndex} 也失败了！`
+          `FATAL: ❌❌❌ [Auth] 紧急回退到账号 #${previousAuthIndex} 也失败了！服务可能中断。`
         );
-        // ...
         this.isAuthSwitching = false;
-        throw fallbackError; // 如果连回退都失败了，就抛出最终错误
+        throw fallbackError;
       }
     }
   }
