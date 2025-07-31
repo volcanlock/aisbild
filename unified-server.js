@@ -1450,6 +1450,10 @@ class ProxyServerSystem extends EventEmitter {
 
   _createExpressApp() {
     const app = express();
+    app.use((req, res, next) => {
+      this.logger.info(`[Entrypoint] 收到一个请求: ${req.method} ${req.path}`);
+      next();
+    });
     const basicAuth = require("basic-auth");
 
     app.use(express.json({ limit: "100mb" }));
