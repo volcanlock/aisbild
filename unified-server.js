@@ -974,21 +974,19 @@ class RequestHandler {
       const endMessage = await messageQueue.dequeue();
 
       if (dataMessage.data) {
+        // --- 保留我们新增的日志诊断代码 ---
         try {
-          // 尝试解析data字段，看看里面有没有我们关心的额外信息
           const fullResponse = JSON.parse(dataMessage.data);
           if (
             fullResponse.candidates &&
             Array.isArray(fullResponse.candidates)
           ) {
             fullResponse.candidates.forEach((candidate, i) => {
-              // 如果finishReason存在且不为正常的'STOP'，就发出警告
               if (candidate.finishReason && candidate.finishReason !== "STOP") {
                 this.logger.warn(
                   `[Server Diagnostics] 响应 #${i} 被提前终止！原因为: ${candidate.finishReason}`
                 );
               }
-              // 如果有安全评级，也检查一下
               if (candidate.safetyRatings) {
                 const highRiskRatings = candidate.safetyRatings.filter(
                   (r) =>
@@ -1008,7 +1006,8 @@ class RequestHandler {
           // 如果解析失败，说明data字段只是纯文本或格式不符，忽略即可
         }
         // --- 日志诊断代码结束 ---
-        res.write(`data: ${JSON.stringify(dataMessage.data)}\n\n`); // 注意：这里需要把整个data对象作为JSON字符串发送
+
+        res.write(`data: ${dataMessage.data}\n\n`);
       }
       if (endMessage.type !== "STREAM_END") {
         this.logger.warn("[Request] 未收到预期的流结束信号。");
