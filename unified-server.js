@@ -633,6 +633,7 @@ class RequestHandler {
     this.usageCount = 0;
     this.isAuthSwitching = false;
     this.needsSwitchingAfterRequest = false;
+    this.isSystemBusy = false;
   }
 
   get currentAuthIndex() {
@@ -665,61 +666,62 @@ class RequestHandler {
       this.logger.warn("[Auth] 😕 检测到只有一个可用账号，拒绝切换操作。");
       throw new Error("Only one account is available, cannot switch.");
     }
-
     if (this.isAuthSwitching) {
       this.logger.info("🔄 [Auth] 正在切换账号，跳过重复操作");
       return { success: false, reason: "Switch already in progress." };
     }
 
+    // --- 加锁！ ---
+    this.isSystemBusy = true;
     this.isAuthSwitching = true;
-    const previousAuthIndex = this.currentAuthIndex;
-    const nextAuthIndex = this._getNextAuthIndex();
-
-    this.logger.info("==================================================");
-    this.logger.info(`🔄 [Auth] 开始账号切换流程`);
-    this.logger.info(`   • 当前账号: #${previousAuthIndex}`);
-    this.logger.info(`   • 目标账号: #${nextAuthIndex}`);
-    this.logger.info("==================================================");
 
     try {
-      await this.browserManager.switchAccount(nextAuthIndex);
-      this.failureCount = 0;
-      this.usageCount = 0;
-      this.logger.info(
-        `✅ [Auth] 成功切换到账号 #${this.currentAuthIndex}，计数已重置。`
-      );
-      this.isAuthSwitching = false;
-      return { success: true, newIndex: this.currentAuthIndex };
-    } catch (error) {
-      this.logger.error(
-        `❌ [Auth] 切换到账号 #${nextAuthIndex} 失败: ${error.message}`
-      );
-      this.logger.warn(
-        `🚨 [Auth] 切换失败，正在尝试回退到上一个可用账号 #${previousAuthIndex}...`
-      );
-      try {
-        await this.browserManager.launchOrSwitchContext(previousAuthIndex);
-        this.logger.info(`✅ [Auth] 成功回退到账号 #${previousAuthIndex}！`);
+      const previousAuthIndex = this.currentAuthIndex;
+      const nextAuthIndex = this._getNextAuthIndex();
 
-        // --- 核心修复：在这里重置计数器！ ---
+      this.logger.info("==================================================");
+      this.logger.info(`🔄 [Auth] 开始账号切换流程`);
+      this.logger.info(`   • 当前账号: #${previousAuthIndex}`);
+      this.logger.info(`   • 目标账号: #${nextAuthIndex}`);
+      this.logger.info("==================================================");
+
+      try {
+        await this.browserManager.switchAccount(nextAuthIndex);
         this.failureCount = 0;
         this.usageCount = 0;
-        this.logger.info("[Auth] 失败和使用计数已在回退成功后重置为0。");
-        // --- 修复结束 ---
-
-        this.isAuthSwitching = false;
-        return {
-          success: false,
-          fallback: true,
-          newIndex: this.currentAuthIndex,
-        };
-      } catch (fallbackError) {
-        this.logger.error(
-          `FATAL: ❌❌❌ [Auth] 紧急回退到账号 #${previousAuthIndex} 也失败了！服务可能中断。`
+        this.logger.info(
+          `✅ [Auth] 成功切换到账号 #${this.currentAuthIndex}，计数已重置。`
         );
-        this.isAuthSwitching = false;
-        throw fallbackError;
+        return { success: true, newIndex: this.currentAuthIndex };
+      } catch (error) {
+        this.logger.error(
+          `❌ [Auth] 切换到账号 #${nextAuthIndex} 失败: ${error.message}`
+        );
+        this.logger.warn(
+          `🚨 [Auth] 切换失败，正在尝试回退到上一个可用账号 #${previousAuthIndex}...`
+        );
+        try {
+          await this.browserManager.launchOrSwitchContext(previousAuthIndex);
+          this.logger.info(`✅ [Auth] 成功回退到账号 #${previousAuthIndex}！`);
+          this.failureCount = 0;
+          this.usageCount = 0;
+          this.logger.info("[Auth] 失败和使用计数已在回退成功后重置为0。");
+          return {
+            success: false,
+            fallback: true,
+            newIndex: this.currentAuthIndex,
+          };
+        } catch (fallbackError) {
+          this.logger.error(
+            `FATAL: ❌❌❌ [Auth] 紧急回退到账号 #${previousAuthIndex} 也失败了！服务可能中断。`
+          );
+          throw fallbackError;
+        }
       }
+    } finally {
+      // --- 解锁！---
+      this.isAuthSwitching = false;
+      this.isSystemBusy = false;
     }
   }
 
@@ -784,7 +786,6 @@ class RequestHandler {
 
   async processRequest(req, res) {
     const requestId = this._generateRequestId();
-
     res.on("close", () => {
       if (!res.writableEnded) {
         this.logger.warn(
@@ -795,14 +796,26 @@ class RequestHandler {
     });
 
     if (!this.connectionRegistry.hasActiveConnections()) {
+      // --- 在恢复前，检查“总锁” ---
+      if (this.isSystemBusy) {
+        this.logger.warn(
+          "[System] 检测到连接断开，但系统正在进行切换/恢复，拒绝新请求。"
+        );
+        return this._sendErrorResponse(
+          res,
+          503,
+          "服务器正在进行内部维护（账号切换/恢复），请稍后重试。"
+        );
+      }
+
       this.logger.error(
         "❌ [System] 检测到浏览器WebSocket连接已断开！可能是进程崩溃。正在尝试恢复..."
       );
+      // --- 开始恢复前，加锁！ ---
+      this.isSystemBusy = true;
       try {
         await this.browserManager.launchOrSwitchContext(this.currentAuthIndex);
-        this.logger.info(
-          `✅ [System] 浏览器已使用账号 #${this.currentAuthIndex} 成功恢复！`
-        );
+        this.logger.info(`✅ [System] 浏览器已成功恢复！`);
       } catch (error) {
         this.logger.error(`❌ [System] 浏览器自动恢复失败: ${error.message}`);
         return this._sendErrorResponse(
@@ -810,26 +823,27 @@ class RequestHandler {
           503,
           "服务暂时不可用：后端浏览器实例崩溃且无法自动恢复，请联系管理员。"
         );
+      } finally {
+        // --- 恢复结束后，解锁！ ---
+        this.isSystemBusy = false;
       }
     }
 
-    if (this.isAuthSwitching) {
+    if (this.isSystemBusy) {
       this.logger.warn(
-        "[System] 收到新请求，但账号正在后台切换中，请稍后重试。"
+        "[System] 收到新请求，但系统正在进行切换/恢复，拒绝新请求。"
       );
       return this._sendErrorResponse(
         res,
         503,
-        "服务暂时不可用：正在切换账号，请在几秒钟后重试。"
+        "服务器正在进行内部维护（账号切换/恢复），请稍后重试。"
       );
     }
 
-    // --- 核心修改：判断是否为生成请求 ---
     const isGenerativeRequest =
       req.method === "POST" &&
       (req.path.includes("generateContent") ||
         req.path.includes("streamGenerateContent"));
-
     if (this.config.switchOnUses > 0 && isGenerativeRequest) {
       this.usageCount++;
       this.logger.info(
@@ -839,12 +853,9 @@ class RequestHandler {
         this.needsSwitchingAfterRequest = true;
       }
     }
-    // --- 修改结束 ---
 
     const proxyRequest = this._buildProxyRequest(req, requestId);
-    // 我们将这个判断结果传递给后续方法
     proxyRequest.is_generative = isGenerativeRequest;
-
     const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
 
     try {
