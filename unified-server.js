@@ -227,7 +227,7 @@ class BrowserManager {
         this.logger.error(
           "❌ [Browser] 浏览器意外断开连接！服务可能需要重启。"
         );
-        this.browser = null; // 标记为已关闭，下次请求会尝试恢复
+        this.browser = null;
         this.context = null;
         this.page = null;
       });
@@ -245,7 +245,7 @@ class BrowserManager {
       this.logger.info("[Browser] 旧上下文已关闭。");
     }
 
-    // 3. 开始为新账号创建全新的上下文
+    // 3. 开始为新账号创建全新的上下文 (这部分逻辑不变)
     const sourceDescription =
       this.authSource.authMode === "env"
         ? `环境变量 AUTH_JSON_${authIndex}`
@@ -272,7 +272,6 @@ class BrowserManager {
     ) {
       let fixedCount = 0;
       const validSameSiteValues = ["Lax", "Strict", "None"];
-
       storageStateObject.cookies.forEach((cookie) => {
         if (!validSameSiteValues.includes(cookie.sameSite)) {
           this.logger.warn(
@@ -282,7 +281,6 @@ class BrowserManager {
           fixedCount++;
         }
       });
-
       if (fixedCount > 0) {
         this.logger.info(
           `[Auth] ✅ 自动修正了 ${fixedCount} 个无效的 Cookie 'sameSite' 属性。`
@@ -304,18 +302,14 @@ class BrowserManager {
     }
 
     try {
-      // 4. 使用浏览器实例创建新的上下文
       this.context = await this.browser.newContext({
         storageState: storageStateObject,
         viewport: { width: 1920, height: 1080 },
       });
       this.page = await this.context.newPage();
-
-      // 5. 接下来的所有逻辑和原来完全一样
       this.page.on("console", (msg) => {
         const msgType = msg.type();
         const msgText = msg.text();
-
         if (msgText.includes("[ProxyClient]")) {
           const cleanMsg = msgText.replace("[ProxyClient] ", "");
           if (msgType === "error" || msgType === "warn") {
@@ -332,38 +326,59 @@ class BrowserManager {
       const targetUrl =
         "https://aistudio.google.com/u/0/apps/bundled/blank?showPreview=true&showCode=true&showAssistant=true";
       await this.page.goto(targetUrl, {
-        timeout: 60000,
+        timeout: 120000,
         waitUntil: "networkidle",
       });
-
       this.logger.info("[Browser] 检查登录状态...");
       const signInButton = this.page.locator(
         'a[href^="https://accounts.google.com/"]'
       );
       const isSignedIn = (await signInButton.count()) === 0;
-
       if (!isSignedIn) {
         throw new Error("Cookie无效或已过期，页面未处于登录状态。");
       }
       this.logger.info("[Browser] ✅ 登录状态正常。");
-      this.logger.info("[Browser] 网页加载完成，正在注入客户端脚本...");
+      this.logger.info("[Browser] 网页加载完成，准备注入脚本...");
+      // 8.26 针对ui更新的内容
+      this.logger.info(
+        '[Browser] UI变更适配：正在点击 "Code" 按钮以切换到代码视图...'
+      );
+      await this.page.getByRole("button", { name: "Code" }).click();
+      this.logger.info("[Browser] 已切换到代码视图。");
 
       const editorContainerLocator = this.page
         .locator("div.monaco-editor")
         .first();
 
-      this.logger.info("[Browser] 等待编辑器出现，最长60秒...");
+      this.logger.info(
+        "[Browser] UI变更适配：等待编辑器附加到DOM，最长120秒..."
+      );
       await editorContainerLocator.waitFor({
-        state: "visible",
-        timeout: 60000,
+        state: "attached",
+        timeout: 120000,
       });
-      this.logger.info("[Browser] 编辑器已出现，准备粘贴脚本。");
+      this.logger.info("[Browser] 编辑器已附加。");
 
-      this.logger.info("[Browser] 暂停3秒并模拟点击以确保页面激活...");
-      await this.page.waitForTimeout(3000);
-      await editorContainerLocator.click({ timeout: 60000 });
+      this.logger.info("[Browser] 暂停5秒并模拟点击以确保页面激活...");
+      await this.page.waitForTimeout(5000);
 
-      await editorContainerLocator.click();
+      const viewport = this.page.viewportSize();
+      if (viewport) {
+        const clickX = viewport.width / 2;
+        const clickY = viewport.height - 120;
+        this.logger.info(
+          `[Browser] 在页面底部 (x≈${Math.round(
+            clickX
+          )}, y=${clickY}) 执行模拟点击。`
+        );
+        await this.page.mouse.click(clickX, clickY);
+      } else {
+        this.logger.warn("[Browser] 无法获取视窗大小，跳过页面底部模拟点击。");
+      }
+
+      this.logger.info("[Browser] 尝试强制点击编辑器以确保焦点...");
+      await editorContainerLocator.click({ force: true, timeout: 120000 });
+
       await this.page.evaluate(
         (text) => navigator.clipboard.writeText(text),
         buildScriptContent
@@ -371,7 +386,17 @@ class BrowserManager {
       const isMac = os.platform() === "darwin";
       const pasteKey = isMac ? "Meta+V" : "Control+V";
       await this.page.keyboard.press(pasteKey);
-      this.logger.info("[Browser] 脚本已粘贴。浏览器端初始化完成。");
+      this.logger.info("[Browser] 脚本已粘贴。");
+
+      this.logger.info(
+        '[Browser] UI变更适配：正在点击 "Preview" 按钮以使代码生效...'
+      );
+      await this.page.getByRole("button", { name: "Preview" }).click();
+      this.logger.info("[Browser] 已切换到预览视图。浏览器端初始化完成。");
+
+      // =========================================================================
+      // --- UI 适配逻辑结束 ---
+      // =========================================================================
 
       this.currentAuthIndex = authIndex;
       this.logger.info("==================================================");
@@ -382,7 +407,22 @@ class BrowserManager {
       this.logger.error(
         `❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`
       );
-      // 如果创建上下文失败，可能是严重问题，选择关闭整个浏览器以触发恢复机制
+      if (this.page) {
+        try {
+          const screenshotPath = path.join(
+            __dirname,
+            `error_screenshot_${authIndex}_${Date.now()}.png`
+          );
+          await this.page.screenshot({ path: screenshotPath, fullPage: true });
+          this.logger.error(
+            `[Browser] 已在失败时截取屏幕快照并保存至: ${screenshotPath}`
+          );
+        } catch (screenshotError) {
+          this.logger.error(
+            `[Browser] 尝试截取屏幕快照失败: ${screenshotError.message}`
+          );
+        }
+      }
       if (this.browser) {
         await this.browser.close();
         this.browser = null;
