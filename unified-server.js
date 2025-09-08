@@ -297,9 +297,15 @@ class BrowserManager {
       this.logger.info("[Browser] ✅ 登录状态正常。");
 
       this.logger.info(
+        "[Browser] UI适配：执行预操作以关闭可能的欢迎弹窗或遮罩层..."
+      );
+      await this.page.waitForTimeout(2000); // 等待2秒让弹窗动画播放完毕
+      await this.page.mouse.click(50, this.page.viewportSize().height - 50); // 点击左下角
+      this.logger.info("[Browser] 预操作完成。");
+
+      this.logger.info(
         '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
       );
-      // --- CORE FIX: Using a text-based selector for more reliability ---
       await this.page.locator('button:text("Code")').click();
 
       this.logger.info(
@@ -327,7 +333,6 @@ class BrowserManager {
       this.logger.info(
         '[Browser] (步骤5/5) 正在点击 "Preview" 按钮以使脚本生效...'
       );
-      // --- CORE FIX: Using a text-based selector for more reliability ---
       await this.page.locator('button:text("Preview")').click();
       this.logger.info("[Browser] ✅ UI交互完成，脚本已开始运行。");
 
