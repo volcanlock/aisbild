@@ -30,7 +30,9 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          # 关键！这里填写你的测试仓库地址
           tags: ellinalopez/cloud-studio:latest
           build-args: |
             CAMOUFOX_URL=${{ env.CAMOUFOX_URL }}
+          # --- 新增：开启Docker层缓存 ---
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
