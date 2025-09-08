@@ -297,34 +297,24 @@ class BrowserManager {
       }
       this.logger.info("[Browser] ✅ 登录状态正常。");
 
-      // =========================================================================
-      // --- 从这里开始，是根据你的截图适配新版UI的核心交互逻辑 ---
-      // =========================================================================
-
-      this.logger.info('[Browser] UI适配：检测到页面默认为 "Preview" 视图。');
       this.logger.info(
-        '[Browser] (步骤1/4) 正在点击 "Code" 按钮以显示编辑器...'
+        '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
       );
-
-      // 使用 Playwright 的 getByRole 定位器，这是最稳健的方式
       await this.page.getByRole("button", { name: "Code" }).click();
 
       this.logger.info(
-        '[Browser] (步骤2/4) "Code" 按钮点击成功，现在等待编辑器变为可见...'
+        '[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...'
       );
-
       const editorContainerLocator = this.page
         .locator("div.monaco-editor")
         .first();
-
-      // 等待条件改回 'visible'，因为点击 "Code" 按钮后，它应该会立刻变为可见
       await editorContainerLocator.waitFor({
         state: "visible",
         timeout: 60000,
       });
-      this.logger.info("[Browser] (步骤3/4) 编辑器已成功显示，准备粘贴脚本...");
 
-      await editorContainerLocator.click(); // 聚焦编辑器
+      this.logger.info("[Browser] (步骤3/5) 编辑器已显示，聚焦并粘贴脚本...");
+      await editorContainerLocator.click();
       await this.page.evaluate(
         (text) => navigator.clipboard.writeText(text),
         buildScriptContent
@@ -332,7 +322,14 @@ class BrowserManager {
       const isMac = os.platform() === "darwin";
       const pasteKey = isMac ? "Meta+V" : "Control+V";
       await this.page.keyboard.press(pasteKey);
-      this.logger.info("[Browser] (步骤4/4) 脚本已粘贴，初始化完成！");
+      this.logger.info("[Browser] (步骤4/5) 脚本已粘贴。");
+
+      // --- 核心修复：新增点击 "Preview" 按钮以执行脚本 ---
+      this.logger.info(
+        '[Browser] (步骤5/5) 正在点击 "Preview" 按钮以使脚本生效...'
+      );
+      await this.page.getByRole("button", { name: "Preview" }).click();
+      this.logger.info("[Browser] ✅ UI交互完成，脚本已开始运行。");
 
       // =========================================================================
       // --- UI 适配逻辑结束 ---
