@@ -203,7 +203,7 @@ class BrowserManager {
   }
 
   async launchOrSwitchContext(authIndex) {
-    // 方法前半部分的浏览器启动和上下文管理逻辑保持不变...
+    // ... (the first part of the method is unchanged) ...
     if (!this.browser) {
       this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动...");
       if (!fs.existsSync(this.browserExecutablePath)) {
@@ -248,7 +248,6 @@ class BrowserManager {
         `Failed to get or parse auth source for index ${authIndex}.`
       );
     }
-    // ...Cookie修正逻辑...
     let buildScriptContent;
     try {
       const scriptFilePath = path.join(__dirname, this.scriptFileName);
@@ -300,7 +299,8 @@ class BrowserManager {
       this.logger.info(
         '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
       );
-      await this.page.getByRole("button", { name: "Code" }).click();
+      // --- CORE FIX: Using a text-based selector for more reliability ---
+      await this.page.locator('button:text("Code")').click();
 
       this.logger.info(
         '[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...'
@@ -324,16 +324,12 @@ class BrowserManager {
       await this.page.keyboard.press(pasteKey);
       this.logger.info("[Browser] (步骤4/5) 脚本已粘贴。");
 
-      // --- 核心修复：新增点击 "Preview" 按钮以执行脚本 ---
       this.logger.info(
         '[Browser] (步骤5/5) 正在点击 "Preview" 按钮以使脚本生效...'
       );
-      await this.page.getByRole("button", { name: "Preview" }).click();
+      // --- CORE FIX: Using a text-based selector for more reliability ---
+      await this.page.locator('button:text("Preview")').click();
       this.logger.info("[Browser] ✅ UI交互完成，脚本已开始运行。");
-
-      // =========================================================================
-      // --- UI 适配逻辑结束 ---
-      // =========================================================================
 
       this.currentAuthIndex = authIndex;
       this.logger.info("==================================================");
