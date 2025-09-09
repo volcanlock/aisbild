@@ -226,12 +226,12 @@ class RequestProcessor {
       requestSpec.body
     ) {
       try {
-        const bodyObj = JSON.parse(requestSpec.body);
+        let bodyObj = JSON.parse(requestSpec.body);
         const isImageModel = requestSpec.path.includes("-image-");
 
-        // --- 增强的过滤逻辑：移除所有可能与“思考”功能相关的参数 ---
+        // --- CORE FIX: Run the filter logic UNCONDITIONALLY for POST requests ---
         if (isImageModel) {
-          const incompatibleKeys = ['tool_config', 'tools', 'toolChoice']; // 定义黑名单
+          const incompatibleKeys = ['tool_config', 'tools', 'toolChoice'];
           let removedKeys = [];
           incompatibleKeys.forEach(key => {
             if (bodyObj.hasOwnProperty(key)) {
@@ -243,14 +243,20 @@ class RequestProcessor {
             Logger.output(`[智能过滤] 检测到图像模型请求，已自动移除不兼容的参数: ${removedKeys.join(', ')}`);
           }
         }
-        // --- 过滤逻辑结束 ---
-
-        // 你的伪装字符串功能被完整保留
-        if (bodyObj.contents?.[0]?.parts?.[0]?.text) {
-          bodyObj.contents[bodyObj.contents.length - 1].parts[
-            bodyObj.contents[bodyObj.contents.length - 1].parts.length - 1
-          ].text += `\n\n[sig:${this._generateRandomString(5)}]`;
+        
+        // --- Keep the signature logic separate ---
+        // Find the last part of the last content entry to append the signature
+        if (bodyObj.contents && Array.isArray(bodyObj.contents) && bodyObj.contents.length > 0) {
+            const lastContent = bodyObj.contents[bodyObj.contents.length - 1];
+            if (lastContent.parts && Array.isArray(lastContent.parts) && lastContent.parts.length > 0) {
+                const lastPart = lastContent.parts[lastContent.parts.length - 1];
+                // Only add signature if the last part is text
+                if (lastPart.text) {
+                    lastPart.text += `\n\n[sig:${this._generateRandomString(5)}]`;
+                }
+            }
         }
+        
         config.body = JSON.stringify(bodyObj);
       } catch (e) {
         config.body = requestSpec.body;
