@@ -227,23 +227,29 @@ class RequestProcessor {
     ) {
       try {
         const bodyObj = JSON.parse(requestSpec.body);
-
-        // --- 新增的核心逻辑：智能过滤不兼容的参数 ---
-        // 通过路径中是否包含 '-image-' 来判断是否为生图模型
         const isImageModel = requestSpec.path.includes("-image-");
-        
-        // 如果是生图模型，并且请求体中包含了tool_config，则删除它
-        if (isImageModel && bodyObj.tool_config) {
-          Logger.output("[智能过滤] 检测到图像模型请求，正在自动移除不兼容的 'tool_config' (Thinking) 参数...");
-          delete bodyObj.tool_config;
-        }
-        // --- 智能过滤逻辑结束 ---
 
+        // --- 增强的过滤逻辑：移除所有可能与“思考”功能相关的参数 ---
+        if (isImageModel) {
+          const incompatibleKeys = ['tool_config', 'tools', 'toolChoice']; // 定义黑名单
+          let removedKeys = [];
+          incompatibleKeys.forEach(key => {
+            if (bodyObj.hasOwnProperty(key)) {
+              delete bodyObj[key];
+              removedKeys.push(key);
+            }
+          });
+          if (removedKeys.length > 0) {
+            Logger.output(`[智能过滤] 检测到图像模型请求，已自动移除不兼容的参数: ${removedKeys.join(', ')}`);
+          }
+        }
+        // --- 过滤逻辑结束 ---
+
+        // 你的伪装字符串功能被完整保留
         if (bodyObj.contents?.[0]?.parts?.[0]?.text) {
           bodyObj.contents[bodyObj.contents.length - 1].parts[
             bodyObj.contents[bodyObj.contents.length - 1].parts.length - 1
           ].text += `\n\n[sig:${this._generateRandomString(5)}]`;
-          Logger.output("已向提示文本末尾添加伪装字符串。");
         }
         config.body = JSON.stringify(bodyObj);
       } catch (e) {
