@@ -229,28 +229,33 @@ class RequestProcessor {
         let bodyObj = JSON.parse(requestSpec.body);
         const isImageModel = requestSpec.path.includes("-image-");
 
-        // --- CORE FIX: Run the filter logic UNCONDITIONALLY for POST requests ---
         if (isImageModel) {
           const incompatibleKeys = ['tool_config', 'tools', 'toolChoice'];
           let removedKeys = [];
+          
+          // 1. 移除顶层的不兼容参数
           incompatibleKeys.forEach(key => {
             if (bodyObj.hasOwnProperty(key)) {
               delete bodyObj[key];
               removedKeys.push(key);
             }
           });
+
+          // 2.【核心修复】移除 generationConfig 内部的 thinkingConfig
+          if (bodyObj.generationConfig && bodyObj.generationConfig.hasOwnProperty('thinkingConfig')) {
+            delete bodyObj.generationConfig.thinkingConfig;
+            removedKeys.push('generationConfig.thinkingConfig');
+          }
+          
           if (removedKeys.length > 0) {
             Logger.output(`[智能过滤] 检测到图像模型请求，已自动移除不兼容的参数: ${removedKeys.join(', ')}`);
           }
         }
         
-        // --- Keep the signature logic separate ---
-        // Find the last part of the last content entry to append the signature
         if (bodyObj.contents && Array.isArray(bodyObj.contents) && bodyObj.contents.length > 0) {
             const lastContent = bodyObj.contents[bodyObj.contents.length - 1];
             if (lastContent.parts && Array.isArray(lastContent.parts) && lastContent.parts.length > 0) {
                 const lastPart = lastContent.parts[lastContent.parts.length - 1];
-                // Only add signature if the last part is text
                 if (lastPart.text) {
                     lastPart.text += `\n\n[sig:${this._generateRandomString(5)}]`;
                 }
