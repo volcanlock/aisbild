@@ -299,20 +299,29 @@ class BrowserManager {
       }
       this.logger.info("[Browser] ✅ 登录状态正常。");
 
-      this.logger.info("[Browser] UI适配：检查并尝试关闭可能的欢迎弹窗...");
+      this.logger.info("[Browser] UI适配：执行健壮的弹窗关闭流程...");
 
-      const closeButtonLocator = this.page.locator('button:text("Got it")'); // <--- 替换成您的选择器
+      // 根据您提供的HTML，'div.dialog' 是整个弹窗的容器
+      const dialogLocator = this.page.locator("div.dialog");
 
       try {
-        await closeButtonLocator.waitFor({ state: "visible", timeout: 5000 });
+        // 步骤1: 等待弹窗容器出现，给它10秒的宽裕时间
+        await dialogLocator.waitFor({ state: "visible", timeout: 10000 });
+        this.logger.info(
+          "[Browser] ✅ 发现对话框容器，正在查找 'Got it' 按钮..."
+        );
 
-        this.logger.info("[Browser] ✅ 发现弹窗，正在点击关闭按钮...");
-        await closeButtonLocator.click();
+        // 步骤2: 在已出现的对话框中，定位并点击按钮
+        // 这样可以避免定位到页面上其他可能也叫"Got it"的不可见元素
+        await dialogLocator.locator('button:text("Got it")').click();
+        this.logger.info("[Browser] 'Got it' 按钮已点击。");
 
-        await this.page.waitForTimeout(1000);
-        this.logger.info("[Browser] 弹窗已关闭。");
+        // 步骤3: 等待弹窗容器从界面上消失，确保后续操作不受干扰
+        await dialogLocator.waitFor({ state: "hidden", timeout: 5000 });
+        this.logger.info("[Browser] 弹窗已确认关闭。");
       } catch (error) {
-        this.logger.info("[Browser] 未在预期时间内发现弹窗，跳过关闭操作。");
+        // 如果在10秒内没有发现弹窗容器，说明本次没有弹窗，属于正常流程
+        this.logger.info("[Browser] 未发现弹窗，跳过关闭操作。");
       }
 
       this.logger.info(
@@ -1680,13 +1689,8 @@ class ProxyServerSystem extends EventEmitter {
             #actions-section button:hover {
               opacity: 0.85;
             }
-            /* 第一个按钮使用蓝色 */
-            #actions-section button:nth-child(1) {
-              background-color: #007bff;
-            }
-            /* 第二个按钮使用绿色 */
-            #actions-section button:nth-child(2) {
-              background-color: #28a745;
+            #actions-section button {
+              background-color: #28a745; /* 统一设置为绿色 */
             }
           </style>
         </head>
