@@ -215,7 +215,6 @@ class RequestProcessor {
     return result;
   }
 
-  // --- 这是我们更新过的、更通用的过滤版本 ---
   _buildRequestConfig(requestSpec, signal) {
     const config = {
       method: requestSpec.method,
@@ -228,33 +227,36 @@ class RequestProcessor {
     ) {
       try {
         let bodyObj = JSON.parse(requestSpec.body);
-        const incompatibleKeys = ["tool_config", "tools", "toolChoice"];
-        let removedKeys = [];
+        const isImageModel = requestSpec.path.includes("-image-");
 
-        // 步骤1: 移除顶层的不兼容参数 (对所有模型生效)
-        incompatibleKeys.forEach((key) => {
-          if (bodyObj.hasOwnProperty(key)) {
-            delete bodyObj[key];
-            removedKeys.push(key);
+        if (isImageModel) {
+          const incompatibleKeys = ["tool_config", "tools", "toolChoice"];
+          let removedKeys = [];
+
+          incompatibleKeys.forEach((key) => {
+            if (bodyObj.hasOwnProperty(key)) {
+              delete bodyObj[key];
+              removedKeys.push(key);
+            }
+          });
+
+          if (
+            bodyObj.generationConfig &&
+            bodyObj.generationConfig.hasOwnProperty("thinkingConfig")
+          ) {
+            delete bodyObj.generationConfig.thinkingConfig;
+            removedKeys.push("generationConfig.thinkingConfig");
           }
-        });
 
-        // 步骤2: 移除 generationConfig 内部的 thinkingConfig (对所有模型生效)
-        if (
-          bodyObj.generationConfig &&
-          bodyObj.generationConfig.hasOwnProperty("thinkingConfig")
-        ) {
-          delete bodyObj.generationConfig.thinkingConfig;
-          removedKeys.push("generationConfig.thinkingConfig");
+          if (removedKeys.length > 0) {
+            Logger.output(
+              `[智能过滤] 检测到图像模型请求，已自动移除不兼容的参数: ${removedKeys.join(
+                ", "
+              )}`
+            );
+          }
         }
 
-        if (removedKeys.length > 0) {
-          Logger.output(
-            `[智能过滤] 已自动移除不兼容的参数: ${removedKeys.join(", ")}`
-          );
-        }
-
-        // 签名逻辑保持不变
         if (
           bodyObj.contents &&
           Array.isArray(bodyObj.contents) &&
@@ -275,7 +277,6 @@ class RequestProcessor {
 
         config.body = JSON.stringify(bodyObj);
       } catch (e) {
-        // 如果解析失败，则使用原始 body
         config.body = requestSpec.body;
       }
     }
