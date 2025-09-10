@@ -1648,12 +1648,56 @@ class ProxyServerSystem extends EventEmitter {
       );
       const logs = this.logger.logBuffer || [];
       const statusHtml = `
-        <!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>代理服务状态</title>
-        <style>body{font-family:'SF Mono','Consolas','Menlo',monospace;background-color:#f0f2f5;color:#333;padding:2em}.container{max-width:800px;margin:0 auto;background:#fff;padding:1em 2em 2em;border-radius:12px;box-shadow:0 4px 6px rgba(0,0,0,.1)}h1,h2{color:#333;border-bottom:2px solid #eee;padding-bottom:.5em}pre{background:#2d2d2d;color:#f0f0f0;font-size:1.1em;padding:1.5em;border-radius:8px;white-space:pre-wrap;word-wrap:break-word;line-height:1.6}#log-container{font-size:.9em;max-height:400px;overflow-y:auto}.status-ok{color:#2ecc71;font-weight:700}.status-error{color:#e74c3c;font-weight:700}.label{display:inline-block;width:220px}.dot{height:10px;width:10px;background-color:#bbb;border-radius:50%;display:inline-block;margin-left:10px;animation:blink 1s infinite alternate}@keyframes blink{from{opacity:.3}to{opacity:1}}</style>
-        </head><body><div class="container"><h1>代理服务状态 <span class="dot" title="数据动态刷新中..."></span></h1><div id="status-section"><pre>
+        <!DOCTYPE html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>代理服务状态</title>
+          <style>
+            body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background-color: #f0f2f5; color: #333; padding: 2em; }
+            .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 1em 2em 2em 2em; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+            h1, h2 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 0.5em;}
+            pre { background: #2d2d2d; color: #f0f0f0; font-size: 1.1em; padding: 1.5em; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
+            #log-container { font-size: 0.9em; max-height: 400px; overflow-y: auto; }
+            .status-ok { color: #2ecc71; font-weight: bold; }
+            .status-error { color: #e74c3c; font-weight: bold; }
+            .label { display: inline-block; width: 220px; }
+            .dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-left: 10px; animation: blink 1s infinite alternate; }
+            @keyframes blink { from { opacity: 0.3; } to { opacity: 1; } }
+
+            /* --- 新增：美化操作按钮的样式 --- */
+            #actions-section button {
+              font-size: 1.1em; /* 字体变大 */
+              color: white; /* 白色字体 */
+              border: none;
+              padding: 10px 20px;
+              border-radius: 8px;
+              cursor: pointer;
+              margin-right: 15px;
+              transition: background-color 0.3s ease;
+            }
+            #actions-section button:hover {
+              opacity: 0.85;
+            }
+            /* 第一个按钮使用蓝色 */
+            #actions-section button:nth-child(1) {
+              background-color: #007bff;
+            }
+            /* 第二个按钮使用绿色 */
+            #actions-section button:nth-child(2) {
+              background-color: #28a745;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h1>代理服务状态 <span class="dot" title="数据动态刷新中..."></span></h1>
+            <div id="status-section">
+              <pre>
 <span class="label">服务状态</span>: <span class="status-ok">Running</span>
 --- 服务配置 ---
-<span class="label">流式模式</span>: ${this.streamingMode}
+<span class="label">流式模式</span>: ${config.streamingMode}
 <span class="label">次数轮换</span>: ${
         config.switchOnUses > 0 ? `每 ${config.switchOnUses} 次` : "已禁用"
       }
@@ -1688,34 +1732,91 @@ class ProxyServerSystem extends EventEmitter {
 <span class="label">浏览器连接</span>: <span class="${
         browserManager.browser ? "status-ok" : "status-error"
       }">${!!browserManager.browser}</span>
-</pre></div><div id="log-section"><h2>实时日志 (最近 ${
-        logs.length
-      } 条)</h2><pre id="log-container">${logs.join(
-        "\n"
-      )}</pre></div><div id="actions-section" style="margin-top:2em"><h2>操作面板</h2><button onclick="switchAccount()">切换账号</button> <button onclick="toggleStreamingMode()">切换流模式</button><a href="/logout" style="float:right;margin-top:10px">登出</a></div></div>
-        <script>
-        function updateContent(){fetch('/api/status').then(e=>e.json()).then(e=>{const t=document.querySelector("#status-section pre");t.innerHTML=\`
+              </pre>
+            </div>
+            <div id="log-section">
+              <h2>实时日志 (最近 ${logs.length} 条)</h2>
+              <pre id="log-container">${logs.join("\n")}</pre>
+            </div>
+            <div id="actions-section" style="margin-top: 2em;">
+                <h2>操作面板</h2>
+                <button onclick="switchAccount()">切换账号</button>
+                <button onclick="toggleStreamingMode()">切换流模式</button>
+            </div>
+          </div>
+          <script>
+            // ... JavaScript 部分保持不变 ...
+            function updateContent() {
+              fetch('/api/status')
+                .then(response => response.json())
+                .then(data => {
+                  const statusPre = document.querySelector('#status-section pre');
+                  statusPre.innerHTML = \`
 <span class="label">服务状态</span>: <span class="status-ok">Running</span>
 --- 服务配置 ---
-<span class="label">流式模式</span>: \${e.status.streamingMode}
-<span class="label">次数轮换</span>: \${e.status.switchOnUses}
-<span class="label">失败切换</span>: \${e.status.failureThreshold}
-<span class="label">立即切换 (状态码)</span>: \${e.status.immediateSwitchStatusCodes}
+<span class="label">流式模式</span>: \${data.status.streamingMode}
+<span class="label">次数轮换</span>: \${data.status.switchOnUses}
+<span class="label">失败切换</span>: \${data.status.failureThreshold}
+<span class="label">立即切换 (状态码)</span>: \${data.status.immediateSwitchStatusCodes}
 --- 账号状态 ---
-<span class="label">扫描到的总账号</span>: \${e.status.initialIndices}
-<span class="label">格式正确 (可用)</span>: \${e.status.availableIndices}
-<span class="label">格式错误 (已忽略)</span>: \${e.status.invalidIndices}
-<span class="label">当前使用账号</span>: #\${e.status.currentAuthIndex}
-<span class="label">使用次数计数</span>: \${e.status.usageCount}
-<span class="label">连续失败计数</span>: \${e.status.failureCount}
+<span class="label">扫描到的总账号</span>: \${data.status.initialIndices}
+<span class="label">格式正确 (可用)</span>: \${data.status.availableIndices}
+<span class="label">格式错误 (已忽略)</span>: \${data.status.invalidIndices}
+<span class="label">当前使用账号</span>: #\${data.status.currentAuthIndex}
+<span class="label">使用次数计数</span>: \${data.status.usageCount}
+<span class="label">连续失败计数</span>: \${data.status.failureCount}
 --- 连接状态 ---
-<span class="label">浏览器连接</span>: <span class="\${e.status.browserConnected?"status-ok":"status-error"}">\${e.status.browserConnected}</span>\`;const o=document.getElementById("log-container"),n=document.querySelector("#log-section h2"),s=o.scrollHeight-o.clientHeight<=o.scrollTop+1;n.innerText=\`实时日志 (最近 \${e.logCount} 条)\`,o.innerText=e.logs,s&&(o.scrollTop=o.scrollHeight)}).catch(e=>console.error("Error fetching new content:",e))}
-        function switchAccount(){confirm("确定要切换到下一个账号吗？")&&fetch("/api/switch-account",{method:"POST"}).then(e=>e.text()).then(e=>{alert(e),updateContent()}).catch(e=>alert("切换失败: "+e))}
-        function toggleStreamingMode(){const e=prompt("请输入新的流模式 (fake 或 real):","${
-          this.streamingMode
-        }");"fake"===e||"real"===e?fetch("/api/set-mode",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:e})}).then(e=>e.text()).then(e=>{alert(e),updateContent()}).catch(e=>alert("设置失败: "+e)):null!==e&&alert("无效的模式！")}
-        document.addEventListener("DOMContentLoaded",()=>{updateContent(),setInterval(updateContent,5000)});
-        </script></body></html>`;
+<span class="label">浏览器连接</span>: <span class="\${data.status.browserConnected ? "status-ok" : "status-error"}">\${data.status.browserConnected}</span>\`;
+                  const logContainer = document.getElementById('log-container');
+                  const logTitle = document.querySelector('#log-section h2');
+                  const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 1;
+                  logTitle.innerText = \`实时日志 (最近 \${data.logCount} 条)\`;
+                  logContainer.innerText = data.logs;
+                  if (isScrolledToBottom) {
+                    logContainer.scrollTop = logContainer.scrollHeight;
+                  }
+                })
+                .catch(error => console.error('Error fetching new content:', error));
+            }
+            function switchAccount() {
+                if (!confirm('确定要切换到下一个账号吗？')) return;
+                fetch('/api/switch-account', { method: 'POST' })
+                    .then(res => res.text())
+                    .then(data => {
+                        alert(data);
+                        updateContent();
+                    })
+                    .catch(err => alert('切换失败: ' + err));
+            }
+            function toggleStreamingMode() {
+                const newMode = prompt('请输入新的流模式 (fake 或 real):', '${
+                  this.streamingMode
+                }');
+                if (newMode === 'fake' || newMode === 'real') {
+                    fetch('/api/set-mode', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ mode: newMode })
+                    })
+                    .then(res => res.text())
+                    .then(data => {
+                        alert(data);
+                        updateContent();
+                    })
+                    .catch(err => alert('设置失败: ' + err));
+                } else if (newMode !== null) {
+                    alert('无效的模式！');
+                }
+            }
+            document.addEventListener('DOMContentLoaded', () => {
+              updateContent();
+              setInterval(updateContent, 5000);
+            });
+          </script>
+        </body>
+        </html>
+      `;
+
       res.status(200).send(statusHtml);
     });
 
