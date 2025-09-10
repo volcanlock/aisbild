@@ -175,23 +175,13 @@ class BrowserManager {
 
     if (this.config.browserExecutablePath) {
       this.browserExecutablePath = this.config.browserExecutablePath;
-      this.logger.info(
-        `[System] 使用环境变量 CAMOUFOX_EXECUTABLE_PATH 指定的浏览器路径。`
-      );
+      this.logger.info(`[System] 使用环境变量 CAMOUFOX_EXECUTABLE_PATH 指定的浏览器路径。`);
     } else {
       const platform = os.platform();
       if (platform === "win32") {
-        this.browserExecutablePath = path.join(
-          __dirname,
-          "camoufox",
-          "camoufox.exe"
-        );
+        this.browserExecutablePath = path.join(__dirname, "camoufox", "camoufox.exe");
       } else if (platform === "linux") {
-        this.browserExecutablePath = path.join(
-          __dirname,
-          "camoufox-linux",
-          "camoufox"
-        );
+        this.browserExecutablePath = path.join(__dirname, "camoufox-linux", "camoufox");
       } else {
         throw new Error(`Unsupported operating system: ${platform}`);
       }
@@ -199,219 +189,132 @@ class BrowserManager {
   }
 
   async launchOrSwitchContext(authIndex) {
+    // --- 浏览器启动和上下文管理的逻辑保持不变 ---
     if (!this.browser) {
       this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动...");
       if (!fs.existsSync(this.browserExecutablePath)) {
-        throw new Error(
-          `Browser executable not found at path: ${this.browserExecutablePath}`
-        );
+        throw new Error(`Browser executable not found at path: ${this.browserExecutablePath}`);
       }
-      this.browser = await firefox.launch({
-        headless: true,
-        executablePath: this.browserExecutablePath,
-      });
+      this.browser = await firefox.launch({ headless: true, executablePath: this.browserExecutablePath });
       this.browser.on("disconnected", () => {
-        this.logger.error(
-          "❌ [Browser] 浏览器意外断开连接！服务可能需要重启。"
-        );
-        this.browser = null;
-        this.context = null;
-        this.page = null;
+        this.logger.error("❌ [Browser] 浏览器意外断开连接！服务可能需要重启。");
+        this.browser = null; this.context = null; this.page = null;
       });
       this.logger.info("✅ [Browser] 浏览器实例已成功启动。");
     }
     if (this.context) {
       this.logger.info("[Browser] 正在关闭旧的浏览器上下文...");
       await this.context.close();
-      this.context = null;
-      this.page = null;
+      this.context = null; this.page = null;
       this.logger.info("[Browser] 旧上下文已关闭。");
     }
 
-    const sourceDescription =
-      this.authSource.authMode === "env"
-        ? `环境变量 AUTH_JSON_${authIndex}`
-        : `文件 auth-${authIndex}.json`;
+    const sourceDescription = this.authSource.authMode === "env" ? `环境变量 AUTH_JSON_${authIndex}` : `文件 auth-${authIndex}.json`;
     this.logger.info("==================================================");
-    this.logger.info(
-      `🔄 [Browser] 正在为账号 #${authIndex} 创建新的浏览器上下文`
-    );
+    this.logger.info(`🔄 [Browser] 正在为账号 #${authIndex} 创建新的浏览器上下文 (简洁模式)`);
     this.logger.info(`   • 认证源: ${sourceDescription}`);
     this.logger.info("==================================================");
-
+    
     const storageStateObject = this.authSource.getAuth(authIndex);
     if (!storageStateObject) {
-      throw new Error(
-        `Failed to get or parse auth source for index ${authIndex}.`
-      );
+      throw new Error(`Failed to get or parse auth source for index ${authIndex}.`);
     }
-    const buildScriptContent = fs.readFileSync(
-      path.join(__dirname, this.scriptFileName),
-      "utf-8"
-    );
+    const buildScriptContent = fs.readFileSync(path.join(__dirname, this.scriptFileName), "utf-8");
 
     try {
-      this.context = await this.browser.newContext({
-        storageState: storageStateObject,
-        viewport: { width: 1920, height: 1080 },
-      });
+      this.context = await this.browser.newContext({ storageState: storageStateObject, viewport: { width: 1920, height: 1080 } });
       this.page = await this.context.newPage();
       this.page.on("console", (msg) => {
         const msgText = msg.text();
         if (msgText.includes("[ProxyClient]")) {
-          this.logger.info(
-            `[Browser] ${msgText.replace("[ProxyClient] ", "")}`
-          );
+          this.logger.info(`[Browser] ${msgText.replace("[ProxyClient] ", "")}`);
         } else if (msg.type() === "error") {
           this.logger.error(`[Browser Page Error] ${msgText}`);
         }
       });
 
+      // 步骤 1: 导航到页面
       this.logger.info(`[Browser] 正在导航至目标网页...`);
-      const targetUrl =
-        "https://aistudio.google.com/u/0/apps/bundled/blank?showPreview=true&showCode=true&showAssistant=true";
+      const targetUrl = "https://aistudio.google.com/u/0/apps/bundled/blank?showPreview=true&showCode=true&showAssistant=true";
+      await this.page.goto(targetUrl, { timeout: 180000, waitUntil: "domcontentloaded" });
+      this.logger.info("[Browser] 页面加载完成。");
 
-      await this.page.goto(targetUrl, {
-        timeout: 180000,
-        waitUntil: "domcontentloaded",
-      });
-      this.logger.info("[Browser] 页面初步加载完成，开始执行UI清理...");
+      // 步骤 2: 只检查 "Got it" 弹窗
+      this.logger.info(`[Browser] 正在检查 "Got it" 弹窗...`);
+      try {
+        const gotItButton = this.page.locator('div.dialog button:text("Got it")');
+        await gotItButton.waitFor({ state: 'visible', timeout: 10000 }); // 等10秒看它出不出现
+        
+        // 步骤 3: 如果找到，就点击它
+        this.logger.info(`[Browser] ✅ 发现 "Got it" 弹窗，正在点击...`);
+        await gotItButton.click({ force: true });
 
-      const closePopupIfVisible = async (locator, description) => {
-        try {
-          await locator.waitFor({ state: "visible", timeout: 5000 });
-          this.logger.info(`[Browser] ✅ 发现: "${description}"，正在点击...`);
-          await locator.click({ force: true });
-          this.logger.info(`[Browser] "${description}" 已点击。`);
-        } catch (error) {
-          this.logger.info(`[Browser] 未发现: "${description}"，跳过。`);
-        }
-      };
+        // 步骤 4: 点击后，智能等待遮罩层消失 (这是比固定等待5-6秒更可靠的方法)
+        this.logger.info(`[Browser] 等待弹窗的遮罩层消失...`);
+        await this.page.locator('div.cdk-overlay-backdrop').waitFor({ state: 'hidden', timeout: 10000 });
+        this.logger.info(`[Browser] 弹窗已确认关闭。`);
 
-      await closePopupIfVisible(
-        this.page.locator('button:text("No thanks")'),
-        "Cookie 同意横幅"
-      );
-      await closePopupIfVisible(
-        this.page.locator('div.dialog button:text("Got it")'),
-        "Got it 弹窗"
-      );
-      await closePopupIfVisible(
-        this.page.locator('[aria-label="Close"]'),
-        "通用关闭按钮(X)"
-      );
-
-      // [核心修复] 升级等待逻辑，以处理页面上可能存在的多个遮罩层
-      this.logger.info(
-        "[Browser] 所有清理点击已执行，正在检查并等待所有遮罩层完全消失..."
-      );
-      const allOverlays = await this.page
-        .locator("div.cdk-overlay-backdrop")
-        .all();
-
-      if (allOverlays.length > 0) {
-        this.logger.info(
-          `[Browser] 发现 ${allOverlays.length} 个遮罩层，正在等待它们全部消失...`
-        );
-        const waitForHiddenPromises = allOverlays.map((overlay) =>
-          overlay.waitFor({ state: "hidden", timeout: 10000 })
-        );
-        await Promise.all(waitForHiddenPromises);
-      } else {
-        this.logger.info(`[Browser] 未发现任何需要等待的遮罩层。`);
+      } catch (error) {
+        this.logger.info(`[Browser] 未发现 "Got it" 弹窗，跳过。`);
       }
-      this.logger.info("[Browser] ✅ 确认页面已干净，所有遮罩层均已消失。");
 
-      this.logger.info(
-        '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
-      );
-      await this.page
-        .locator('button:text("Code")')
-        .click({ timeout: 15000, force: true });
+      // 步骤 5: 点击 "Code" 按钮
+      this.logger.info('[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...');
+      await this.page.locator('button:text("Code")').click({ timeout: 15000 });
 
-      this.logger.info(
-        '[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...'
-      );
-      const editorContainerLocator = this.page
-        .locator("div.monaco-editor")
-        .first();
-      await editorContainerLocator.waitFor({
-        state: "visible",
-        timeout: 60000,
-      });
-
+      // ... 后续的注入脚本逻辑保持不变 ...
+      this.logger.info('[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...');
+      const editorContainerLocator = this.page.locator("div.monaco-editor").first();
+      await editorContainerLocator.waitFor({ state: "visible", timeout: 60000 });
       this.logger.info("[Browser] (步骤3/5) 编辑器已显示，聚焦并粘贴脚本...");
       await editorContainerLocator.click();
-      await this.page.evaluate(
-        (text) => navigator.clipboard.writeText(text),
-        buildScriptContent
-      );
+      await this.page.evaluate((text) => navigator.clipboard.writeText(text), buildScriptContent);
       const isMac = os.platform() === "darwin";
       const pasteKey = isMac ? "Meta+V" : "Control+V";
       await this.page.keyboard.press(pasteKey);
       this.logger.info("[Browser] (步骤4/5) 脚本已粘贴。");
-
-      this.logger.info(
-        '[Browser] (步骤5/5) 正在点击 "Preview" 按钮以使脚本生效...'
-      );
+      this.logger.info('[Browser] (步骤5/5) 正在点击 "Preview" 按钮以使脚本生效...');
       await this.page.locator('button:text("Preview")').click();
       this.logger.info("[Browser] ✅ UI交互完成，脚本已开始运行。");
-
       this.currentAuthIndex = authIndex;
       this.logger.info("==================================================");
       this.logger.info(`✅ [Browser] 账号 ${authIndex} 的上下文初始化成功！`);
       this.logger.info("✅ [Browser] 浏览器客户端已准备就绪。");
       this.logger.info("==================================================");
+
     } catch (error) {
-      this.logger.error(
-        `❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`
-      );
+      // ... 错误处理逻辑保持不变 ...
+      this.logger.error(`❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`);
       if (this.page) {
         try {
-          const screenshotPath = path.join(
-            __dirname,
-            `error_screenshot_${authIndex}_${Date.now()}.png`
-          );
+          const screenshotPath = path.join(__dirname, `error_screenshot_${authIndex}_${Date.now()}.png`);
           await this.page.screenshot({ path: screenshotPath, fullPage: true });
-          this.logger.error(
-            `[Browser] 已在失败时截取屏幕快照并保存至: ${screenshotPath}`
-          );
+          this.logger.error(`[Browser] 已在失败时截取屏幕快照并保存至: ${screenshotPath}`);
         } catch (screenshotError) {
-          this.logger.error(
-            `[Browser] 尝试截取屏幕快照失败: ${screenshotError.message}`
-          );
+          this.logger.error(`[Browser] 尝试截取屏幕快照失败: ${screenshotError.message}`);
         }
       }
-      if (this.browser) {
-        await this.browser.close();
-        this.browser = null;
-      }
+      if (this.browser) { await this.browser.close(); this.browser = null; }
       throw error;
     }
   }
 
+  // closeBrowser 和 switchAccount 方法保持不变
   async closeBrowser() {
     if (this.browser) {
       this.logger.info("[Browser] 正在关闭整个浏览器实例...");
       await this.browser.close();
-      this.browser = null;
-      this.context = null;
-      this.page = null;
+      this.browser = null; this.context = null; this.page = null;
       this.logger.info("[Browser] 浏览器实例已关闭。");
     }
   }
 
   async switchAccount(newAuthIndex) {
-    this.logger.info(
-      `🔄 [Browser] 开始账号切换: 从 ${this.currentAuthIndex} 到 ${newAuthIndex}`
-    );
+    this.logger.info(`🔄 [Browser] 开始账号切换: 从 ${this.currentAuthIndex} 到 ${newAuthIndex}`);
     await this.launchOrSwitchContext(newAuthIndex);
-    this.logger.info(
-      `✅ [Browser] 账号切换完成，当前账号: ${this.currentAuthIndex}`
-    );
+    this.logger.info(`✅ [Browser] 账号切换完成，当前账号: ${this.currentAuthIndex}`);
   }
 }
-
 // ===================================================================================
 // PROXY SERVER MODULE
 // ===================================================================================
