@@ -167,9 +167,9 @@ class BrowserManager {
     this.logger = logger;
     this.config = config;
     this.authSource = authSource;
-    this.browser = null; // 浏览器实例，在服务生命周期内只启动一次
-    this.context = null; // 浏览器上下文，每次切换账号时会更换
-    this.page = null; // 页面，随上下文一起更换
+    this.browser = null;
+    this.context = null;
+    this.page = null;
     this.currentAuthIndex = 0;
     this.scriptFileName = "black-browser.js";
 
@@ -186,26 +186,192 @@ class BrowserManager {
           "camoufox",
           "camoufox.exe"
         );
-        this.logger.info(
-          `[System] 检测到操作系统: Windows. 将使用 'camoufox' 目录下的浏览器。`
-        );
       } else if (platform === "linux") {
         this.browserExecutablePath = path.join(
           __dirname,
           "camoufox-linux",
           "camoufox"
         );
-        this.logger.info(
-          `[System] 检测到操作系统: Linux. 将使用 'camoufox-linux' 目录下的浏览器。`
-        );
       } else {
-        this.logger.error(`[System] 不支持的操作系统: ${platform}.`);
         throw new Error(`Unsupported operating system: ${platform}`);
       }
     }
   }
 
-  // closeBrowser 现在只用于服务关闭或严重错误后的彻底清理
+  async launchOrSwitchContext(authIndex) {
+    if (!this.browser) {
+      this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动...");
+      if (!fs.existsSync(this.browserExecutablePath)) {
+        throw new Error(
+          `Browser executable not found at path: ${this.browserExecutablePath}`
+        );
+      }
+      this.browser = await firefox.launch({
+        headless: true,
+        executablePath: this.browserExecutablePath,
+      });
+      this.browser.on("disconnected", () => {
+        this.logger.error(
+          "❌ [Browser] 浏览器意外断开连接！服务可能需要重启。"
+        );
+        this.browser = null;
+        this.context = null;
+        this.page = null;
+      });
+      this.logger.info("✅ [Browser] 浏览器实例已成功启动。");
+    }
+    if (this.context) {
+      this.logger.info("[Browser] 正在关闭旧的浏览器上下文...");
+      await this.context.close();
+      this.context = null;
+      this.page = null;
+      this.logger.info("[Browser] 旧上下文已关闭。");
+    }
+
+    const sourceDescription =
+      this.authSource.authMode === "env"
+        ? `环境变量 AUTH_JSON_${authIndex}`
+        : `文件 auth-${authIndex}.json`;
+    this.logger.info("==================================================");
+    this.logger.info(
+      `🔄 [Browser] 正在为账号 #${authIndex} 创建新的浏览器上下文`
+    );
+    this.logger.info(`   • 认证源: ${sourceDescription}`);
+    this.logger.info("==================================================");
+
+    const storageStateObject = this.authSource.getAuth(authIndex);
+    if (!storageStateObject) {
+      throw new Error(
+        `Failed to get or parse auth source for index ${authIndex}.`
+      );
+    }
+    const buildScriptContent = fs.readFileSync(
+      path.join(__dirname, this.scriptFileName),
+      "utf-8"
+    );
+
+    try {
+      this.context = await this.browser.newContext({
+        storageState: storageStateObject,
+        viewport: { width: 1920, height: 1080 },
+      });
+      this.page = await this.context.newPage();
+      this.page.on("console", (msg) => {
+        const msgText = msg.text();
+        if (msgText.includes("[ProxyClient]")) {
+          this.logger.info(
+            `[Browser] ${msgText.replace("[ProxyClient] ", "")}`
+          );
+        } else if (msg.type() === "error") {
+          this.logger.error(`[Browser Page Error] ${msgText}`);
+        }
+      });
+
+      this.logger.info(`[Browser] 正在导航至目标网页...`);
+      const targetUrl =
+        "https://aistudio.google.com/u/0/apps/bundled/blank?showPreview=true&showCode=true&showAssistant=true";
+
+      await this.page.goto(targetUrl, {
+        timeout: 180000,
+        waitUntil: "domcontentloaded",
+      });
+      this.logger.info("[Browser] 页面初步加载完成，开始执行UI清理...");
+
+      const closePopupIfVisible = async (locator, description) => {
+        try {
+          await locator.waitFor({ state: "visible", timeout: 7000 });
+          this.logger.info(
+            `[Browser] ✅ 发现遮挡物: "${description}"，正在尝试关闭...`
+          );
+          await locator.click({ trial: true }); // Use trial click to be safer
+          await this.page.waitForTimeout(1000);
+          this.logger.info(`[Browser] "${description}" 已关闭。`);
+        } catch (error) {
+          this.logger.info(`[Browser] 未发现遮挡物: "${description}"，跳过。`);
+        }
+      };
+
+      await closePopupIfVisible(
+        this.page.locator('button:text("No thanks")'),
+        "Cookie 同意横幅"
+      );
+      await closePopupIfVisible(
+        this.page.locator('div.dialog button:text("Got it")'),
+        "Got it 弹窗"
+      );
+      await closePopupIfVisible(
+        this.page.locator('[aria-label="Close"]'),
+        "通用关闭按钮(X)"
+      );
+
+      this.logger.info("[Browser] UI防御性清理流程执行完毕。");
+
+      this.logger.info(
+        '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
+      );
+      await this.page.locator('button:text("Code")').click({ timeout: 15000 });
+
+      this.logger.info(
+        '[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...'
+      );
+      const editorContainerLocator = this.page
+        .locator("div.monaco-editor")
+        .first();
+      await editorContainerLocator.waitFor({
+        state: "visible",
+        timeout: 60000,
+      });
+
+      this.logger.info("[Browser] (步骤3/5) 编辑器已显示，聚焦并粘贴脚本...");
+      await editorContainerLocator.click();
+      await this.page.evaluate(
+        (text) => navigator.clipboard.writeText(text),
+        buildScriptContent
+      );
+      const isMac = os.platform() === "darwin";
+      const pasteKey = isMac ? "Meta+V" : "Control+V";
+      await this.page.keyboard.press(pasteKey);
+      this.logger.info("[Browser] (步骤4/5) 脚本已粘贴。");
+
+      this.logger.info(
+        '[Browser] (步骤5/5) 正在点击 "Preview" 按钮以使脚本生效...'
+      );
+      await this.page.locator('button:text("Preview")').click();
+      this.logger.info("[Browser] ✅ UI交互完成，脚本已开始运行。");
+
+      this.currentAuthIndex = authIndex;
+      this.logger.info("==================================================");
+      this.logger.info(`✅ [Browser] 账号 ${authIndex} 的上下文初始化成功！`);
+      this.logger.info("✅ [Browser] 浏览器客户端已准备就绪。");
+      this.logger.info("==================================================");
+    } catch (error) {
+      this.logger.error(
+        `❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`
+      );
+      if (this.page) {
+        try {
+          const screenshotPath = path.join(
+            __dirname,
+            `error_screenshot_${authIndex}_${Date.now()}.png`
+          );
+          await this.page.screenshot({ path: screenshotPath, fullPage: true });
+          this.logger.error(
+            `[Browser] 已在失败时截取屏幕快照并保存至: ${screenshotPath}`
+          );
+        } catch (screenshotError) {
+          this.logger.error(
+            `[Browser] 尝试截取屏幕快照失败: ${screenshotError.message}`
+          );
+        }
+      }
+      if (this.browser) {
+        await this.browser.close();
+        this.browser = null;
+      }
+      throw error;
+    }
+  }
+
   async closeBrowser() {
     if (this.browser) {
       this.logger.info("[Browser] 正在关闭整个浏览器实例...");
@@ -217,12 +383,10 @@ class BrowserManager {
     }
   }
 
-  // switchAccount 现在的逻辑变得非常简单和高效
   async switchAccount(newAuthIndex) {
     this.logger.info(
       `🔄 [Browser] 开始账号切换: 从 ${this.currentAuthIndex} 到 ${newAuthIndex}`
     );
-    // 直接调用新的上下文切换方法，而不是重启浏览器
     await this.launchOrSwitchContext(newAuthIndex);
     this.logger.info(
       `✅ [Browser] 账号切换完成，当前账号: ${this.currentAuthIndex}`
