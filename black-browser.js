@@ -215,7 +215,6 @@ class RequestProcessor {
     return result;
   }
 
-  // --- 这是我们更新过的、更通用的过滤版本 ---
   _buildRequestConfig(requestSpec, signal) {
     const config = {
       method: requestSpec.method,
@@ -228,54 +227,43 @@ class RequestProcessor {
     ) {
       try {
         let bodyObj = JSON.parse(requestSpec.body);
-        const incompatibleKeys = ["tool_config", "tools", "toolChoice"];
-        let removedKeys = [];
+        const isImageModel = requestSpec.path.includes("-image-");
 
-        // 步骤1: 移除顶层的不兼容参数 (对所有模型生效)
-        incompatibleKeys.forEach((key) => {
-          if (bodyObj.hasOwnProperty(key)) {
-            delete bodyObj[key];
-            removedKeys.push(key);
-          }
-        });
-
-        // 步骤2: 移除 generationConfig 内部的 thinkingConfig (对所有模型生效)
-        if (
-          bodyObj.generationConfig &&
-          bodyObj.generationConfig.hasOwnProperty("thinkingConfig")
-        ) {
-          delete bodyObj.generationConfig.thinkingConfig;
-          removedKeys.push("generationConfig.thinkingConfig");
-        }
-
-        if (removedKeys.length > 0) {
-          Logger.output(
-            `[智能过滤] 已自动移除不兼容的参数: ${removedKeys.join(", ")}`
-          );
-        }
-
-        // 签名逻辑保持不变
-        if (
-          bodyObj.contents &&
-          Array.isArray(bodyObj.contents) &&
-          bodyObj.contents.length > 0
-        ) {
-          const lastContent = bodyObj.contents[bodyObj.contents.length - 1];
-          if (
-            lastContent.parts &&
-            Array.isArray(lastContent.parts) &&
-            lastContent.parts.length > 0
-          ) {
-            const lastPart = lastContent.parts[lastContent.parts.length - 1];
-            if (lastPart.text) {
-              lastPart.text += `\n\n[sig:${this._generateRandomString(5)}]`;
+        if (isImageModel) {
+          const incompatibleKeys = ['tool_config', 'tools', 'toolChoice'];
+          let removedKeys = [];
+          
+          // 1. 移除顶层的不兼容参数
+          incompatibleKeys.forEach(key => {
+            if (bodyObj.hasOwnProperty(key)) {
+              delete bodyObj[key];
+              removedKeys.push(key);
             }
+          });
+
+          // 2.【核心修复】移除 generationConfig 内部的 thinkingConfig
+          if (bodyObj.generationConfig && bodyObj.generationConfig.hasOwnProperty('thinkingConfig')) {
+            delete bodyObj.generationConfig.thinkingConfig;
+            removedKeys.push('generationConfig.thinkingConfig');
+          }
+          
+          if (removedKeys.length > 0) {
+            Logger.output(`[智能过滤] 检测到图像模型请求，已自动移除不兼容的参数: ${removedKeys.join(', ')}`);
           }
         }
-
+        
+        if (bodyObj.contents && Array.isArray(bodyObj.contents) && bodyObj.contents.length > 0) {
+            const lastContent = bodyObj.contents[bodyObj.contents.length - 1];
+            if (lastContent.parts && Array.isArray(lastContent.parts) && lastContent.parts.length > 0) {
+                const lastPart = lastContent.parts[lastContent.parts.length - 1];
+                if (lastPart.text) {
+                    lastPart.text += `\n\n[sig:${this._generateRandomString(5)}]`;
+                }
+            }
+        }
+        
         config.body = JSON.stringify(bodyObj);
       } catch (e) {
-        // 如果解析失败，则使用原始 body
         config.body = requestSpec.body;
       }
     }
@@ -305,7 +293,7 @@ class RequestProcessor {
       controller.abort();
     }
   }
-} // <--- 关键！确保这个括号存在
+}
 
 class ProxySystem extends EventTarget {
   constructor(websocketEndpoint) {
@@ -498,13 +486,12 @@ class ProxySystem extends EventTarget {
       message: `代理端浏览器错误: ${error.message || "未知错误"}`,
     });
     // --- 核心修改：根据错误类型，使用不同的日志措辞 ---
-    if (error.name === "AbortError") {
-      Logger.output("已将“中止”状态发送回服务器");
+    if (error.name === 'AbortError') {
+        Logger.output("已将“中止”状态发送回服务器");
     } else {
-      Logger.output("已将“错误”信息发送回服务器");
+        Logger.output("已将“错误”信息发送回服务器");
     }
   }
-}
 
 async function initializeProxySystem() {
   // 清理旧的日志
