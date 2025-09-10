@@ -325,7 +325,9 @@ class BrowserManager {
       this.logger.info(
         '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
       );
-      await this.page.locator('button:text("Code")').click({ timeout: 15000 });
+      await this.page
+        .locator('button:text("Code")')
+        .click({ timeout: 15000, force: true });
 
       this.logger.info(
         '[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...'
