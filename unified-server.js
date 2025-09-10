@@ -277,25 +277,21 @@ class BrowserManager {
       });
       this.logger.info("[Browser] 页面初步加载完成，开始执行UI清理...");
 
-      const overlayLocator = this.page.locator("div.cdk-overlay-backdrop");
+      // ========================== 核心修改：最终的防御性清理流程 ==========================
 
       const closePopupIfVisible = async (locator, description) => {
         try {
-          await locator.waitFor({ state: "visible", timeout: 7000 });
-          this.logger.info(
-            `[Browser] ✅ 发现遮挡物: "${description}"，正在尝试关闭...`
-          );
-          await locator.click({ trial: true });
-
-          // [核心修复] 关键一步：在点击后，智能等待遮罩层消失，而不是固定等待1秒
-          this.logger.info(`[Browser] 等待 "${description}" 的遮罩层消失...`);
-          await overlayLocator.waitFor({ state: "hidden", timeout: 5000 });
-          this.logger.info(`[Browser] "${description}" 已确认关闭。`);
+          // 只需等待按钮出现并点击，不再等待动画
+          await locator.waitFor({ state: "visible", timeout: 5000 });
+          this.logger.info(`[Browser] ✅ 发现: "${description}"，正在点击...`);
+          await locator.click({ force: true }); // 使用force:true来应对可能的动画遮挡
+          this.logger.info(`[Browser] "${description}" 已点击。`);
         } catch (error) {
-          this.logger.info(`[Browser] 未发现遮挡物: "${description}"，跳过。`);
+          this.logger.info(`[Browser] 未发现: "${description}"，跳过。`);
         }
       };
 
+      // 快速执行所有可能的点击操作
       await closePopupIfVisible(
         this.page.locator('button:text("No thanks")'),
         "Cookie 同意横幅"
@@ -309,7 +305,16 @@ class BrowserManager {
         "通用关闭按钮(X)"
       );
 
-      this.logger.info("[Browser] UI防御性清理流程执行完毕。");
+      // [关键修复] 在所有点击操作完成后，执行一次最终的、决定性的等待
+      this.logger.info(
+        "[Browser] 所有清理点击已执行，正在等待所有遮罩层完全消失..."
+      );
+      await this.page
+        .locator("div.cdk-overlay-backdrop")
+        .waitFor({ state: "hidden", timeout: 10000 });
+      this.logger.info("[Browser] ✅ 确认页面已干净，所有遮罩层均已消失。");
+
+      // =================================================================================
 
       this.logger.info(
         '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
