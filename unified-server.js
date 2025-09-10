@@ -277,15 +277,20 @@ class BrowserManager {
       });
       this.logger.info("[Browser] 页面初步加载完成，开始执行UI清理...");
 
+      const overlayLocator = this.page.locator("div.cdk-overlay-backdrop");
+
       const closePopupIfVisible = async (locator, description) => {
         try {
           await locator.waitFor({ state: "visible", timeout: 7000 });
           this.logger.info(
             `[Browser] ✅ 发现遮挡物: "${description}"，正在尝试关闭...`
           );
-          await locator.click({ trial: true }); // Use trial click to be safer
-          await this.page.waitForTimeout(1000);
-          this.logger.info(`[Browser] "${description}" 已关闭。`);
+          await locator.click({ trial: true });
+
+          // [核心修复] 关键一步：在点击后，智能等待遮罩层消失，而不是固定等待1秒
+          this.logger.info(`[Browser] 等待 "${description}" 的遮罩层消失...`);
+          await overlayLocator.waitFor({ state: "hidden", timeout: 5000 });
+          this.logger.info(`[Browser] "${description}" 已确认关闭。`);
         } catch (error) {
           this.logger.info(`[Browser] 未发现遮挡物: "${description}"，跳过。`);
         }
