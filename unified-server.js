@@ -277,21 +277,17 @@ class BrowserManager {
       });
       this.logger.info("[Browser] 页面初步加载完成，开始执行UI清理...");
 
-      // ========================== 核心修改：最终的防御性清理流程 ==========================
-
       const closePopupIfVisible = async (locator, description) => {
         try {
-          // 只需等待按钮出现并点击，不再等待动画
           await locator.waitFor({ state: "visible", timeout: 5000 });
           this.logger.info(`[Browser] ✅ 发现: "${description}"，正在点击...`);
-          await locator.click({ force: true }); // 使用force:true来应对可能的动画遮挡
+          await locator.click({ force: true });
           this.logger.info(`[Browser] "${description}" 已点击。`);
         } catch (error) {
           this.logger.info(`[Browser] 未发现: "${description}"，跳过。`);
         }
       };
 
-      // 快速执行所有可能的点击操作
       await closePopupIfVisible(
         this.page.locator('button:text("No thanks")'),
         "Cookie 同意横幅"
@@ -305,16 +301,26 @@ class BrowserManager {
         "通用关闭按钮(X)"
       );
 
-      // [关键修复] 在所有点击操作完成后，执行一次最终的、决定性的等待
+      // [核心修复] 升级等待逻辑，以处理页面上可能存在的多个遮罩层
       this.logger.info(
-        "[Browser] 所有清理点击已执行，正在等待所有遮罩层完全消失..."
+        "[Browser] 所有清理点击已执行，正在检查并等待所有遮罩层完全消失..."
       );
-      await this.page
+      const allOverlays = await this.page
         .locator("div.cdk-overlay-backdrop")
-        .waitFor({ state: "hidden", timeout: 10000 });
-      this.logger.info("[Browser] ✅ 确认页面已干净，所有遮罩层均已消失。");
+        .all();
 
-      // =================================================================================
+      if (allOverlays.length > 0) {
+        this.logger.info(
+          `[Browser] 发现 ${allOverlays.length} 个遮罩层，正在等待它们全部消失...`
+        );
+        const waitForHiddenPromises = allOverlays.map((overlay) =>
+          overlay.waitFor({ state: "hidden", timeout: 10000 })
+        );
+        await Promise.all(waitForHiddenPromises);
+      } else {
+        this.logger.info(`[Browser] 未发现任何需要等待的遮罩层。`);
+      }
+      this.logger.info("[Browser] ✅ 确认页面已干净，所有遮罩层均已消失。");
 
       this.logger.info(
         '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
