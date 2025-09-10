@@ -172,15 +172,28 @@ class BrowserManager {
     this.page = null;
     this.currentAuthIndex = 0;
     this.scriptFileName = "black-browser.js";
+    // [优化] 为低内存的Docker/云环境设置优化的启动参数
+    this.launchArgs = [
+        '--disable-dev-shm-usage', // 关键！防止 /dev/shm 空间不足导致浏览器崩溃
+        '--disable-gpu',           // 禁用GPU硬件加速
+        '--no-sandbox',            // 在受限的容器环境中通常需要
+        '--disable-setuid-sandbox',
+        '--disable-infobars',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-extensions',
+        '--disable-sync',
+        '--disable-translate',
+        '--metrics-recording-only',
+        '--mute-audio',
+        '--safebrowsing-disable-auto-update',
+    ];
 
     if (this.config.browserExecutablePath) {
       this.browserExecutablePath = this.config.browserExecutablePath;
-      this.logger.info(`[System] 使用环境变量 CAMOUFOX_EXECUTABLE_PATH 指定的浏览器路径。`);
     } else {
       const platform = os.platform();
-      if (platform === "win32") {
-        this.browserExecutablePath = path.join(__dirname, "camoufox", "camoufox.exe");
-      } else if (platform === "linux") {
+      if (platform === "linux") {
         this.browserExecutablePath = path.join(__dirname, "camoufox-linux", "camoufox");
       } else {
         throw new Error(`Unsupported operating system: ${platform}`);
@@ -189,15 +202,19 @@ class BrowserManager {
   }
 
   async launchOrSwitchContext(authIndex) {
-    // --- 浏览器启动和上下文管理的逻辑保持不变 ---
     if (!this.browser) {
-      this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动...");
+      this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动(低资源模式)...");
       if (!fs.existsSync(this.browserExecutablePath)) {
         throw new Error(`Browser executable not found at path: ${this.browserExecutablePath}`);
       }
-      this.browser = await firefox.launch({ headless: true, executablePath: this.browserExecutablePath });
+      // [优化] 启动浏览器时应用优化参数
+      this.browser = await firefox.launch({
+        headless: true,
+        executablePath: this.browserExecutablePath,
+        args: this.launchArgs 
+      });
       this.browser.on("disconnected", () => {
-        this.logger.error("❌ [Browser] 浏览器意外断开连接！服务可能需要重启。");
+        this.logger.error("❌ [Browser] 浏览器意外断开连接！(可能是资源不足)");
         this.browser = null; this.context = null; this.page = null;
       });
       this.logger.info("✅ [Browser] 浏览器实例已成功启动。");
@@ -233,34 +250,33 @@ class BrowserManager {
         }
       });
 
-      // 步骤 1: 导航到页面
       this.logger.info(`[Browser] 正在导航至目标网页...`);
       const targetUrl = "https://aistudio.google.com/u/0/apps/bundled/blank?showPreview=true&showCode=true&showAssistant=true";
       await this.page.goto(targetUrl, { timeout: 180000, waitUntil: "domcontentloaded" });
       this.logger.info("[Browser] 页面加载完成。");
 
-      // 步骤 2: 只检查 "Got it" 弹窗
-      this.logger.info(`[Browser] 正在检查 "Got it" 弹窗...`);
+      // [优化] 在进行任何操作前，先给页面一个“呼吸”的时间，等待JS加载
+      await this.page.waitForTimeout(3000);
+
+      // [核心修改] 回归最简洁的逻辑：只处理 "Got it" 弹窗
+      this.logger.info(`[Browser] (简洁模式) 正在检查 "Got it" 弹窗...`);
       try {
         const gotItButton = this.page.locator('div.dialog button:text("Got it")');
-        await gotItButton.waitFor({ state: 'visible', timeout: 10000 }); // 等10秒看它出不出现
-        
-        // 步骤 3: 如果找到，就点击它
+        // 等待按钮出现，如果10秒内没有，就认为不存在
+        await gotItButton.waitFor({ state: 'visible', timeout: 10000 });
         this.logger.info(`[Browser] ✅ 发现 "Got it" 弹窗，正在点击...`);
         await gotItButton.click({ force: true });
-
-        // 步骤 4: 点击后，智能等待遮罩层消失 (这是比固定等待5-6秒更可靠的方法)
-        this.logger.info(`[Browser] 等待弹窗的遮罩层消失...`);
-        await this.page.locator('div.cdk-overlay-backdrop').waitFor({ state: 'hidden', timeout: 10000 });
-        this.logger.info(`[Browser] 弹窗已确认关闭。`);
+        
+        // [核心修改] 严格按照您的要求：点击后，固定等待一个较长的时间，让所有动画结束
+        this.logger.info(`[Browser] "Got it" 已点击，固定等待8秒让页面稳定...`);
+        await this.page.waitForTimeout(8000);
 
       } catch (error) {
         this.logger.info(`[Browser] 未发现 "Got it" 弹窗，跳过。`);
       }
 
-      // 步骤 5: 点击 "Code" 按钮
       this.logger.info('[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...');
-      await this.page.locator('button:text("Code")').click({ timeout: 15000 });
+      await this.page.locator('button:text("Code")').click({ timeout: 20000 }); // 增加点击超时
 
       // ... 后续的注入脚本逻辑保持不变 ...
       this.logger.info('[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...');
@@ -283,23 +299,13 @@ class BrowserManager {
       this.logger.info("==================================================");
 
     } catch (error) {
-      // ... 错误处理逻辑保持不变 ...
       this.logger.error(`❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`);
-      if (this.page) {
-        try {
-          const screenshotPath = path.join(__dirname, `error_screenshot_${authIndex}_${Date.now()}.png`);
-          await this.page.screenshot({ path: screenshotPath, fullPage: true });
-          this.logger.error(`[Browser] 已在失败时截取屏幕快照并保存至: ${screenshotPath}`);
-        } catch (screenshotError) {
-          this.logger.error(`[Browser] 尝试截取屏幕快照失败: ${screenshotError.message}`);
-        }
-      }
+      // [优化] 根据您的要求，移除截图功能
       if (this.browser) { await this.browser.close(); this.browser = null; }
       throw error;
     }
   }
 
-  // closeBrowser 和 switchAccount 方法保持不变
   async closeBrowser() {
     if (this.browser) {
       this.logger.info("[Browser] 正在关闭整个浏览器实例...");
@@ -315,6 +321,7 @@ class BrowserManager {
     this.logger.info(`✅ [Browser] 账号切换完成，当前账号: ${this.currentAuthIndex}`);
   }
 }
+
 // ===================================================================================
 // PROXY SERVER MODULE
 // ===================================================================================
