@@ -175,7 +175,7 @@ class BrowserManager {
     // [优化] 为低内存的Docker/云环境设置优化的启动参数
     this.launchArgs = [
         '--disable-dev-shm-usage', // 关键！防止 /dev/shm 空间不足导致浏览器崩溃
-        '--disable-gpu',           // 禁用GPU硬件加速
+        '--disable-gpu',
         '--no-sandbox',            // 在受限的容器环境中通常需要
         '--disable-setuid-sandbox',
         '--disable-infobars',
@@ -203,7 +203,7 @@ class BrowserManager {
 
   async launchOrSwitchContext(authIndex) {
     if (!this.browser) {
-      this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动(低资源模式)...");
+      this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动...");
       if (!fs.existsSync(this.browserExecutablePath)) {
         throw new Error(`Browser executable not found at path: ${this.browserExecutablePath}`);
       }
@@ -259,7 +259,7 @@ class BrowserManager {
       await this.page.waitForTimeout(3000);
 
       // [核心修改] 回归最简洁的逻辑：只处理 "Got it" 弹窗
-      this.logger.info(`[Browser] (简洁模式) 正在检查 "Got it" 弹窗...`);
+      this.logger.info(`[Browser] 正在检查 "Got it" 弹窗...`);
       try {
         const gotItButton = this.page.locator('div.dialog button:text("Got it")');
         // 等待按钮出现，如果10秒内没有，就认为不存在
@@ -268,7 +268,7 @@ class BrowserManager {
         await gotItButton.click({ force: true });
         
         // [核心修改] 严格按照您的要求：点击后，固定等待一个较长的时间，让所有动画结束
-        this.logger.info(`[Browser] "Got it" 已点击，固定等待8秒让页面稳定...`);
+        this.logger.info(`[Browser] "Got it" 已点击，等待8秒让页面稳定...`);
         await this.page.waitForTimeout(8000);
 
       } catch (error) {
@@ -277,8 +277,7 @@ class BrowserManager {
 
       this.logger.info('[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...');
       await this.page.locator('button:text("Code")').click({ timeout: 20000 }); // 增加点击超时
-
-      // ... 后续的注入脚本逻辑保持不变 ...
+      
       this.logger.info('[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...');
       const editorContainerLocator = this.page.locator("div.monaco-editor").first();
       await editorContainerLocator.waitFor({ state: "visible", timeout: 60000 });
@@ -300,7 +299,6 @@ class BrowserManager {
 
     } catch (error) {
       this.logger.error(`❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`);
-      // [优化] 根据您的要求，移除截图功能
       if (this.browser) { await this.browser.close(); this.browser = null; }
       throw error;
     }
@@ -338,7 +336,7 @@ class LoggingService {
     const formatted = `[${level}] ${timestamp} [${this.serviceName}] - ${message}`;
 
     // 将格式化后的日志存入缓冲区
-    this.logBuffer.push(formatted);
+   this.logBuffer.push(formatted);
     // 如果缓冲区超过最大长度，则从头部删除旧的日志
     if (this.logBuffer.length > this.maxBufferSize) {
       this.logBuffer.shift();
@@ -1728,3 +1726,4 @@ if (require.main === module) {
 }
 
 module.exports = { ProxyServerSystem, BrowserManager, initializeServer };
+
