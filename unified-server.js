@@ -241,7 +241,7 @@ class BrowserManager {
         : `文件 auth-${authIndex}.json`;
     this.logger.info("==================================================");
     this.logger.info(
-      `🔄 [Browser] 正在为账号 #${authIndex} 创建新的浏览器上下文 (简洁模式)`
+      `🔄 [Browser] 正在为账号 #${authIndex} 创建新的浏览器上下文`
     );
     this.logger.info(`   • 认证源: ${sourceDescription}`);
     this.logger.info("==================================================");
@@ -1265,8 +1265,9 @@ class ProxyServerSystem extends EventEmitter {
       retryDelay: 2000,
       browserExecutablePath: null,
       apiKeys: [],
-      // [修改#2] 设置默认的状态码
       immediateSwitchStatusCodes: [429, 503],
+      // [新增] 用于追踪API密钥来源
+      apiKeySource: "未设置",
     };
 
     const configPath = path.join(__dirname, "config.json");
@@ -1306,7 +1307,6 @@ class ProxyServerSystem extends EventEmitter {
     let rawCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES;
     let codesSource = "环境变量";
 
-    // 注意：这里的逻辑会确保环境变量优先于文件，文件优先于默认值
     if (
       !rawCodes &&
       config.immediateSwitchStatusCodes &&
@@ -1336,12 +1336,13 @@ class ProxyServerSystem extends EventEmitter {
       config.apiKeys = [];
     }
 
-    // [修改#3] 如果没有设置任何API Key，则启用默认密码
-    if (config.apiKeys.length === 0) {
+    // [修改] 更新API密钥来源的判断逻辑
+    if (config.apiKeys.length > 0) {
+      config.apiKeySource = "自定义 (环境变量或文件)";
+    } else {
       config.apiKeys = ["123456"];
-      this.logger.info(
-        "[System] 未通过环境变量或配置文件设置API Key，已启用默认密码: 123456"
-      );
+      config.apiKeySource = "默认";
+      this.logger.info("[System] 未设置任何API Key，已启用默认密码: 123456");
     }
 
     this.config = config;
@@ -1372,13 +1373,7 @@ class ProxyServerSystem extends EventEmitter {
     );
     this.logger.info(`  单次请求最大重试: ${this.config.maxRetries}次`);
     this.logger.info(`  重试间隔: ${this.config.retryDelay}ms`);
-    if (this.config.apiKeys && this.config.apiKeys.length > 0) {
-      this.logger.info(
-        `  API 密钥认证: 已启用 (${this.config.apiKeys.length} 个密钥)`
-      );
-    } else {
-      this.logger.info(`  API 密钥认证: 已禁用`);
-    }
+    this.logger.info(`  API 密钥来源: ${this.config.apiKeySource}`); // 在启动日志中也显示出来
     this.logger.info(
       "============================================================="
     );
@@ -1624,7 +1619,6 @@ class ProxyServerSystem extends EventEmitter {
             .label { display: inline-block; width: 220px; }
             .dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-left: 10px; animation: blink 1s infinite alternate; }
             @keyframes blink { from { opacity: 0.3; } to { opacity: 1; } }
-            /* [修改#4] 更新操作面板样式 */
             .action-group { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; }
             .action-group button, .action-group select { font-size: 1em; border: 1px solid #ccc; padding: 10px 15px; border-radius: 8px; cursor: pointer; transition: background-color 0.3s ease; }
             .action-group button:hover { opacity: 0.85; }
@@ -1648,6 +1642,7 @@ class ProxyServerSystem extends EventEmitter {
           ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
           : "已禁用"
       }
+<span class="label">API 密钥</span>: ${config.apiKeySource}
 --- 账号状态 ---
 <span class="label">当前使用账号</span>: #${requestHandler.currentAuthIndex}
 <span class="label">使用次数计数</span>: ${requestHandler.usageCount} / ${
@@ -1687,6 +1682,7 @@ class ProxyServerSystem extends EventEmitter {
 --- 服务配置 ---
 <span class="label">流式模式</span>: \${data.status.streamingMode}
 <span class="label">立即切换 (状态码)</span>: \${data.status.immediateSwitchStatusCodes}
+<span class="label">API 密钥</span>: \${data.status.apiKeySource}
 --- 账号状态 ---
 <span class="label">当前使用账号</span>: #\${data.status.currentAuthIndex}
 <span class="label">使用次数计数</span>: \${data.status.usageCount}
@@ -1705,7 +1701,6 @@ class ProxyServerSystem extends EventEmitter {
                 }).catch(error => console.error('Error fetching new content:', error));
             }
 
-            // [修改#4] 此函数现在由按钮点击触发
             function switchSpecificAccount() {
                 const selectElement = document.getElementById('accountIndexSelect');
                 const targetIndex = selectElement.value;
@@ -1751,13 +1746,11 @@ class ProxyServerSystem extends EventEmitter {
       res.status(200).send(statusHtml);
     });
 
-    // API 路由保持不变...
     app.get("/api/status", isAuthenticated, (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
       const initialIndices = authSource.initialIndices || [];
-      const availableIndices = authSource.availableIndices || [];
       const invalidIndices = initialIndices.filter(
-        (i) => !availableIndices.includes(i)
+        (i) => !authSource.availableIndices.includes(i)
       );
       const logs = this.logger.logBuffer || [];
       const data = {
@@ -1768,6 +1761,8 @@ class ProxyServerSystem extends EventEmitter {
             config.immediateSwitchStatusCodes.length > 0
               ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
               : "已禁用",
+          // [新增] 将apiKeySource暴露给API
+          apiKeySource: config.apiKeySource,
           currentAuthIndex: requestHandler.currentAuthIndex,
           usageCount: `${requestHandler.usageCount} / ${
             config.switchOnUses > 0 ? config.switchOnUses : "N/A"
@@ -1787,6 +1782,8 @@ class ProxyServerSystem extends EventEmitter {
       };
       res.json(data);
     });
+
+    // API 路由和代理主逻辑保持不变...
     app.post("/api/switch-account", isAuthenticated, async (req, res) => {
       try {
         const { targetIndex } = req.body;
@@ -1840,8 +1837,6 @@ class ProxyServerSystem extends EventEmitter {
         res.status(400).send('无效模式. 请用 "fake" 或 "real".');
       }
     });
-
-    // Section 4 (代理主逻辑) 保持不变...
     app.use(this._createAuthMiddleware());
     app.all(/(.*)/, (req, res) => {
       this.requestHandler.processRequest(req, res);
