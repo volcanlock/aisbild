@@ -1522,16 +1522,14 @@ class ProxyServerSystem extends EventEmitter {
     const app = express();
 
     // ==========================================================
-    // Section 1: 核心中间件配置
+    // Section 1: 核心中间件配置 (这部分保持不变)
     // ==========================================================
-
-    // [已修复] 恢复旧版文件中的入口日志记录器，确保所有请求都会被记录
     app.use((req, res, next) => {
       if (
         req.path !== "/api/status" &&
         req.path !== "/" &&
         req.path !== "/favicon.ico" &&
-        req.path !== "/login" // 登录页本身也不记录
+        req.path !== "/login"
       ) {
         this.logger.info(
           `[Entrypoint] 收到一个请求: ${req.method} ${req.path}`
@@ -1539,12 +1537,8 @@ class ProxyServerSystem extends EventEmitter {
       }
       next();
     });
-
-    // 用于解析 JSON 和原始请求体
     app.use(express.json({ limit: "100mb" }));
     app.use(express.raw({ type: "*/*", limit: "100mb" }));
-
-    // Session 和 Cookie 配置 (为网页UI保留)
     const sessionSecret =
       (this.config.apiKeys && this.config.apiKeys[0]) ||
       crypto.randomBytes(20).toString("hex");
@@ -1557,8 +1551,6 @@ class ProxyServerSystem extends EventEmitter {
         cookie: { secure: false, maxAge: 86400000 },
       })
     );
-
-    // 认证检查中间件，仅用于保护需要网页登录的页面
     const isAuthenticated = (req, res, next) => {
       if (req.session.isAuthenticated) {
         return next();
@@ -1567,9 +1559,8 @@ class ProxyServerSystem extends EventEmitter {
     };
 
     // ==========================================================
-    // Section 2: 公开及网页UI路由 (这些路由要么公开，要么受网页Session保护)
+    // Section 2: 公开及网页UI路由 (这部分保持不变)
     // ==========================================================
-
     app.get("/login", (req, res) => {
       if (req.session.isAuthenticated) {
         return res.redirect("/");
@@ -1596,7 +1587,9 @@ class ProxyServerSystem extends EventEmitter {
       }
     });
 
-    // 状态主页和相关API受网页Session保护
+    // ==========================================================
+    // Section 3: 状态页面 和 API (核心修改区域)
+    // ==========================================================
     app.get("/", isAuthenticated, (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
       const initialIndices = authSource.initialIndices || [];
@@ -1605,6 +1598,12 @@ class ProxyServerSystem extends EventEmitter {
         (i) => !availableIndices.includes(i)
       );
       const logs = this.logger.logBuffer || [];
+
+      // 为下拉列表生成 <option> HTML
+      const accountOptionsHtml = availableIndices
+        .map((index) => `<option value="${index}">账号 #${index}</option>`)
+        .join("");
+
       const statusHtml = `
         <!DOCTYPE html>
         <html lang="zh-CN">
@@ -1623,9 +1622,12 @@ class ProxyServerSystem extends EventEmitter {
             .label { display: inline-block; width: 220px; }
             .dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-left: 10px; animation: blink 1s infinite alternate; }
             @keyframes blink { from { opacity: 0.3; } to { opacity: 1; } }
-            #actions-section button { font-size: 1.1em; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; margin-right: 15px; transition: background-color 0.3s ease; }
-            #actions-section button:hover { opacity: 0.85; }
-            #actions-section button { background-color: #007bff; }
+            .action-group { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; }
+            .action-group button, .action-group select { font-size: 1em; color: white; border: none; padding: 10px 15px; border-radius: 8px; cursor: pointer; transition: background-color 0.3s ease; }
+            .action-group button:hover, .action-group select:hover { opacity: 0.85; }
+            .action-group button { background-color: #007bff; }
+            .action-group .btn-secondary { background-color: #6c757d; }
+            .action-group select { background-color: #28a745; color: white; -webkit-appearance: none; appearance: none; text-align: center;}
           </style>
         </head>
         <body>
@@ -1634,31 +1636,17 @@ class ProxyServerSystem extends EventEmitter {
             <div id="status-section">
               <pre>
 <span class="label">服务状态</span>: <span class="status-ok">Running</span>
+<span class="label">浏览器连接</span>: <span class="${
+        browserManager.browser ? "status-ok" : "status-error"
+      }">${!!browserManager.browser}</span>
 --- 服务配置 ---
 <span class="label">流式模式</span>: ${config.streamingMode}
-<span class="label">次数轮换</span>: ${
-        config.switchOnUses > 0 ? `每 ${config.switchOnUses} 次` : "已禁用"
-      }
-<span class="label">失败切换</span>: ${
-        config.failureThreshold > 0
-          ? `失败 ${config.failureThreshold} 次后切换`
-          : "已禁用"
-      }
 <span class="label">立即切换 (状态码)</span>: ${
         config.immediateSwitchStatusCodes.length > 0
           ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
           : "已禁用"
       }
 --- 账号状态 ---
-<span class="label">扫描到的总账号</span>: [${initialIndices.join(
-        ", "
-      )}] (总数: ${initialIndices.length})
-<span class="label">格式正确 (可用)</span>: [${availableIndices.join(
-        ", "
-      )}] (总数: ${availableIndices.length})
-<span class="label">格式错误 (已忽略)</span>: [${invalidIndices.join(
-        ", "
-      )}] (总数: ${invalidIndices.length})
 <span class="label">当前使用账号</span>: #${requestHandler.currentAuthIndex}
 <span class="label">使用次数计数</span>: ${requestHandler.usageCount} / ${
         config.switchOnUses > 0 ? config.switchOnUses : "N/A"
@@ -1666,25 +1654,25 @@ class ProxyServerSystem extends EventEmitter {
 <span class="label">连续失败计数</span>: ${requestHandler.failureCount} / ${
         config.failureThreshold > 0 ? config.failureThreshold : "N/A"
       }
---- 连接状态 ---
-<span class="label">浏览器连接</span>: <span class="${
-        browserManager.browser ? "status-ok" : "status-error"
-      }">${!!browserManager.browser}</span>
+<span class="label">扫描到的总帐号</span>: [${initialIndices.join(
+        ", "
+      )}] (总数: ${initialIndices.length})
+<span class="label">格式错误 (已忽略)</span>: [${invalidIndices.join(
+        ", "
+      )}] (总数: ${invalidIndices.length})
               </pre>
             </div>
-            <div id="log-section">
-              <h2>实时日志 (最近 ${logs.length} 条)</h2>
-              <pre id="log-container">${logs.join("\n")}</pre>
-            </div>
-            <div id="actions-section" style="margin-top: 2em;">
+             <div id="actions-section" style="margin-top: 2em;">
                 <h2>操作面板</h2>
-                <div style="display: flex; flex-wrap: wrap; gap: 15px; align-items: center;">
-                    <div>
-                        <input type="number" id="accountIndexInput" placeholder="账号ID" style="padding: 10px; border-radius: 8px; border: 1px solid #ccc; width: 80px;"/>
-                        <button onclick="switchAccount()">切换账号</button>
-                    </div>
+                <div class="action-group">
+                    <select id="accountIndexSelect" onchange="switchSpecificAccount()">${accountOptionsHtml}</select>
+                    <button class="btn-secondary" onclick="switchToNextAccount()">切换到下一个</button>
                     <button onclick="toggleStreamingMode()">切换流模式</button>
                 </div>
+            </div>
+            <div id="log-section" style="margin-top: 2em;">
+              <h2>实时日志 (最近 ${logs.length} 条)</h2>
+              <pre id="log-container">${logs.join("\n")}</pre>
             </div>
           </div>
           <script>
@@ -1693,20 +1681,20 @@ class ProxyServerSystem extends EventEmitter {
                   const statusPre = document.querySelector('#status-section pre');
                   statusPre.innerHTML = \`
 <span class="label">服务状态</span>: <span class="status-ok">Running</span>
+<span class="label">浏览器连接</span>: <span class="\${data.status.browserConnected ? "status-ok" : "status-error"}">\${data.status.browserConnected}</span>
 --- 服务配置 ---
 <span class="label">流式模式</span>: \${data.status.streamingMode}
-<span class="label">次数轮换</span>: \${data.status.switchOnUses}
-<span class="label">失败切换</span>: \${data.status.failureThreshold}
 <span class="label">立即切换 (状态码)</span>: \${data.status.immediateSwitchStatusCodes}
 --- 账号状态 ---
-<span class="label">扫描到的总账号</span>: \${data.status.initialIndices}
-<span class="label">格式正确 (可用)</span>: \${data.status.availableIndices}
-<span class="label">格式错误 (已忽略)</span>: \${data.status.invalidIndices}
 <span class="label">当前使用账号</span>: #\${data.status.currentAuthIndex}
 <span class="label">使用次数计数</span>: \${data.status.usageCount}
 <span class="label">连续失败计数</span>: \${data.status.failureCount}
---- 连接状态 ---
-<span class="label">浏览器连接</span>: <span class="\${data.status.browserConnected ? "status-ok" : "status-error"}">\${data.status.browserConnected}</span>\`;
+<span class="label">扫描到的总账号</span>: \${data.status.initialIndices}
+<span class="label">格式错误 (已忽略)</span>: \${data.status.invalidIndices}\`;
+                  
+                  // 更新下拉列表的选中项以匹配当前账号
+                  document.getElementById('accountIndexSelect').value = data.status.currentAuthIndex;
+
                   const logContainer = document.getElementById('log-container');
                   const logTitle = document.querySelector('#log-section h2');
                   const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 1;
@@ -1715,30 +1703,33 @@ class ProxyServerSystem extends EventEmitter {
                   if (isScrolledToBottom) { logContainer.scrollTop = logContainer.scrollHeight; }
                 }).catch(error => console.error('Error fetching new content:', error));
             }
-            
-            function switchAccount() {
-                const targetIndex = document.getElementById('accountIndexInput').value;
-                let confirmationMessage = '';
-                let apiBody = null;
-                if (targetIndex) {
-                     confirmationMessage = \`确定要切换到账号 #\${targetIndex} 吗？这会重置浏览器会话。\`;
-                     apiBody = JSON.stringify({ targetIndex: parseInt(targetIndex, 10) });
-                } else {
-                     confirmationMessage = '未指定账号ID，确定要切换到下一个可用账号吗？';
-                     apiBody = JSON.stringify({});
+
+            function switchSpecificAccount() {
+                const selectElement = document.getElementById('accountIndexSelect');
+                const targetIndex = selectElement.value;
+                if (!confirm(\`确定要切换到账号 #\${targetIndex} 吗？这会重置浏览器会话。\`)) {
+                    // 如果用户取消，将下拉列表恢复到当前实际账号
+                    updateContent(); 
+                    return;
                 }
-                if (!confirm(confirmationMessage)) return;
                 fetch('/api/switch-account', {
                      method: 'POST',
                      headers: { 'Content-Type': 'application/json' },
-                     body: apiBody
+                     body: JSON.stringify({ targetIndex: parseInt(targetIndex, 10) })
                 })
-                .then(res => res.text())
-                .then(data => {
-                    alert(data);
-                    updateContent();
+                .then(res => res.text()).then(data => { alert(data); updateContent(); })
+                .catch(err => { alert('操作失败: ' + err); updateContent(); });
+            }
+
+            function switchToNextAccount() {
+                if (!confirm('确定要切换到下一个可用账号吗？')) return;
+                fetch('/api/switch-account', {
+                     method: 'POST',
+                     headers: { 'Content-Type': 'application/json' },
+                     body: JSON.stringify({}) // 发送空对象以触发“下一个”逻辑
                 })
-                .catch(err => alert('操作失败: ' + err));
+                .then(res => res.text()).then(data => { alert(data); updateContent(); })
+                .catch(err => { alert('操作失败: ' + err); updateContent(); });
             }
 
             function toggleStreamingMode() { 
@@ -1751,17 +1742,21 @@ class ProxyServerSystem extends EventEmitter {
                         headers: { 'Content-Type': 'application/json' }, 
                         body: JSON.stringify({ mode: newMode }) 
                     })
-                    .then(res => res.text())
-                    .then(data => { 
-                        alert(data); 
-                        updateContent(); 
-                    })
+                    .then(res => res.text()).then(data => { alert(data); updateContent(); })
                     .catch(err => alert('设置失败: ' + err));
                 } else if (newMode !== null) { 
                     alert('无效的模式！'); 
                 } 
             }
-            document.addEventListener('DOMContentLoaded', () => { updateContent(); setInterval(updateContent, 5000); });
+
+            document.addEventListener('DOMContentLoaded', () => {
+                // 页面加载时，立即将下拉列表设置为当前账号
+                const selectElement = document.getElementById('accountIndexSelect');
+                selectElement.value = "${requestHandler.currentAuthIndex}";
+                // 启动定时刷新
+                updateContent(); 
+                setInterval(updateContent, 5000);
+            });
           </script>
         </body>
         </html>
@@ -1771,7 +1766,6 @@ class ProxyServerSystem extends EventEmitter {
 
     app.get("/api/status", isAuthenticated, (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
-      // ... (rest of the /api/status logic is identical to your file) ...
       const initialIndices = authSource.initialIndices || [];
       const availableIndices = authSource.availableIndices || [];
       const invalidIndices = initialIndices.filter(
@@ -1781,25 +1775,11 @@ class ProxyServerSystem extends EventEmitter {
       const data = {
         status: {
           streamingMode: this.streamingMode,
-          switchOnUses:
-            config.switchOnUses > 0 ? `每 ${config.switchOnUses} 次` : "已禁用",
-          failureThreshold:
-            config.failureThreshold > 0
-              ? `失败 ${config.failureThreshold} 次后切换`
-              : "已禁用",
+          browserConnected: !!browserManager.browser,
           immediateSwitchStatusCodes:
             config.immediateSwitchStatusCodes.length > 0
               ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
               : "已禁用",
-          initialIndices: `[${initialIndices.join(", ")}] (总数: ${
-            initialIndices.length
-          })`,
-          availableIndices: `[${availableIndices.join(", ")}] (总数: ${
-            availableIndices.length
-          })`,
-          invalidIndices: `[${invalidIndices.join(", ")}] (总数: ${
-            invalidIndices.length
-          })`,
           currentAuthIndex: requestHandler.currentAuthIndex,
           usageCount: `${requestHandler.usageCount} / ${
             config.switchOnUses > 0 ? config.switchOnUses : "N/A"
@@ -1807,7 +1787,12 @@ class ProxyServerSystem extends EventEmitter {
           failureCount: `${requestHandler.failureCount} / ${
             config.failureThreshold > 0 ? config.failureThreshold : "N/A"
           }`,
-          browserConnected: !!browserManager.browser,
+          initialIndices: `[${initialIndices.join(", ")}] (总数: ${
+            initialIndices.length
+          })`,
+          invalidIndices: `[${invalidIndices.join(", ")}] (总数: ${
+            invalidIndices.length
+          })`,
         },
         logs: logs.join("\n"),
         logCount: logs.length,
@@ -1818,9 +1803,7 @@ class ProxyServerSystem extends EventEmitter {
     app.post("/api/switch-account", isAuthenticated, async (req, res) => {
       try {
         const { targetIndex } = req.body;
-
-        if (targetIndex !== undefined) {
-          // --- 切换到指定账号的逻辑 ---
+        if (targetIndex !== undefined && targetIndex !== null) {
           this.logger.info(
             `[WebUI] 收到切换到指定账号 #${targetIndex} 的请求...`
           );
@@ -1833,7 +1816,6 @@ class ProxyServerSystem extends EventEmitter {
             res.status(400).send(result.reason);
           }
         } else {
-          // --- 切换到下一个账号的逻辑 (原逻辑) ---
           this.logger.info("[WebUI] 收到手动切换下一个账号的请求...");
           if (this.authSource.availableIndices.length <= 1) {
             return res
@@ -1874,14 +1856,10 @@ class ProxyServerSystem extends EventEmitter {
     });
 
     // ==========================================================
-    // Section 4: 代理主逻辑 (捕获所有其他请求)
+    // Section 4: 代理主逻辑 (保持不变)
     // ==========================================================
-
-    // [已修复] 恢复旧版文件的正确逻辑：API代理仅通过API Key认证
     app.use(this._createAuthMiddleware());
-
     app.all(/(.*)/, (req, res) => {
-      // 这里的请求就是来自SillyTavern等的API请求，直接处理
       this.requestHandler.processRequest(req, res);
     });
 
