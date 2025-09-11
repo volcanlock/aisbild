@@ -1338,7 +1338,7 @@ class ProxyServerSystem extends EventEmitter {
 
     // [修改] 更新API密钥来源的判断逻辑
     if (config.apiKeys.length > 0) {
-      config.apiKeySource = "自定义 (环境变量或文件)";
+      config.apiKeySource = "自定义";
     } else {
       config.apiKeys = ["123456"];
       config.apiKeySource = "默认";
@@ -1586,7 +1586,7 @@ class ProxyServerSystem extends EventEmitter {
     });
 
     // ==========================================================
-    // Section 3: 状态页面 和 API (核心修改区域)
+    // Section 3: 状态页面 和 API (最终版)
     // ==========================================================
     app.get("/", isAuthenticated, (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
@@ -1690,7 +1690,8 @@ class ProxyServerSystem extends EventEmitter {
 <span class="label">扫描到的总账号</span>: \${data.status.initialIndices}
 <span class="label">格式错误 (已忽略)</span>: \${data.status.invalidIndices}\`;
                   
-                  document.getElementById('accountIndexSelect').value = data.status.currentAuthIndex;
+                  // [修改] 删除此行，不再强制同步下拉框的显示
+                  // document.getElementById('accountIndexSelect').value = data.status.currentAuthIndex;
 
                   const logContainer = document.getElementById('log-container');
                   const logTitle = document.querySelector('#log-section h2');
@@ -1734,8 +1735,9 @@ class ProxyServerSystem extends EventEmitter {
             }
 
             document.addEventListener('DOMContentLoaded', () => {
-                const selectElement = document.getElementById('accountIndexSelect');
-                selectElement.value = "${requestHandler.currentAuthIndex}";
+                // [修改] 删除此行，让下拉框默认显示第一个选项
+                // const selectElement = document.getElementById('accountIndexSelect');
+                // selectElement.value = "${requestHandler.currentAuthIndex}";
                 updateContent(); 
                 setInterval(updateContent, 5000);
             });
@@ -1746,6 +1748,7 @@ class ProxyServerSystem extends EventEmitter {
       res.status(200).send(statusHtml);
     });
 
+    // API 路由和代理主逻辑保持不变...
     app.get("/api/status", isAuthenticated, (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
       const initialIndices = authSource.initialIndices || [];
@@ -1761,7 +1764,6 @@ class ProxyServerSystem extends EventEmitter {
             config.immediateSwitchStatusCodes.length > 0
               ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
               : "已禁用",
-          // [新增] 将apiKeySource暴露给API
           apiKeySource: config.apiKeySource,
           currentAuthIndex: requestHandler.currentAuthIndex,
           usageCount: `${requestHandler.usageCount} / ${
@@ -1782,8 +1784,6 @@ class ProxyServerSystem extends EventEmitter {
       };
       res.json(data);
     });
-
-    // API 路由和代理主逻辑保持不变...
     app.post("/api/switch-account", isAuthenticated, async (req, res) => {
       try {
         const { targetIndex } = req.body;
