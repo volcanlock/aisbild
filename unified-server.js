@@ -174,19 +174,19 @@ class BrowserManager {
     this.scriptFileName = "black-browser.js";
     // [优化] 为低内存的Docker/云环境设置优化的启动参数
     this.launchArgs = [
-        '--disable-dev-shm-usage', // 关键！防止 /dev/shm 空间不足导致浏览器崩溃
-        '--disable-gpu',
-        '--no-sandbox',            // 在受限的容器环境中通常需要
-        '--disable-setuid-sandbox',
-        '--disable-infobars',
-        '--disable-background-networking',
-        '--disable-default-apps',
-        '--disable-extensions',
-        '--disable-sync',
-        '--disable-translate',
-        '--metrics-recording-only',
-        '--mute-audio',
-        '--safebrowsing-disable-auto-update',
+      "--disable-dev-shm-usage", // 关键！防止 /dev/shm 空间不足导致浏览器崩溃
+      "--disable-gpu",
+      "--no-sandbox", // 在受限的容器环境中通常需要
+      "--disable-setuid-sandbox",
+      "--disable-infobars",
+      "--disable-background-networking",
+      "--disable-default-apps",
+      "--disable-extensions",
+      "--disable-sync",
+      "--disable-translate",
+      "--metrics-recording-only",
+      "--mute-audio",
+      "--safebrowsing-disable-auto-update",
     ];
 
     if (this.config.browserExecutablePath) {
@@ -194,7 +194,11 @@ class BrowserManager {
     } else {
       const platform = os.platform();
       if (platform === "linux") {
-        this.browserExecutablePath = path.join(__dirname, "camoufox-linux", "camoufox");
+        this.browserExecutablePath = path.join(
+          __dirname,
+          "camoufox-linux",
+          "camoufox"
+        );
       } else {
         throw new Error(`Unsupported operating system: ${platform}`);
       }
@@ -205,54 +209,78 @@ class BrowserManager {
     if (!this.browser) {
       this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动...");
       if (!fs.existsSync(this.browserExecutablePath)) {
-        throw new Error(`Browser executable not found at path: ${this.browserExecutablePath}`);
+        throw new Error(
+          `Browser executable not found at path: ${this.browserExecutablePath}`
+        );
       }
       // [优化] 启动浏览器时应用优化参数
       this.browser = await firefox.launch({
         headless: true,
         executablePath: this.browserExecutablePath,
-        args: this.launchArgs 
+        args: this.launchArgs,
       });
       this.browser.on("disconnected", () => {
         this.logger.error("❌ [Browser] 浏览器意外断开连接！(可能是资源不足)");
-        this.browser = null; this.context = null; this.page = null;
+        this.browser = null;
+        this.context = null;
+        this.page = null;
       });
       this.logger.info("✅ [Browser] 浏览器实例已成功启动。");
     }
     if (this.context) {
       this.logger.info("[Browser] 正在关闭旧的浏览器上下文...");
       await this.context.close();
-      this.context = null; this.page = null;
+      this.context = null;
+      this.page = null;
       this.logger.info("[Browser] 旧上下文已关闭。");
     }
 
-    const sourceDescription = this.authSource.authMode === "env" ? `环境变量 AUTH_JSON_${authIndex}` : `文件 auth-${authIndex}.json`;
+    const sourceDescription =
+      this.authSource.authMode === "env"
+        ? `环境变量 AUTH_JSON_${authIndex}`
+        : `文件 auth-${authIndex}.json`;
     this.logger.info("==================================================");
-    this.logger.info(`🔄 [Browser] 正在为账号 #${authIndex} 创建新的浏览器上下文 (简洁模式)`);
+    this.logger.info(
+      `🔄 [Browser] 正在为账号 #${authIndex} 创建新的浏览器上下文 (简洁模式)`
+    );
     this.logger.info(`   • 认证源: ${sourceDescription}`);
     this.logger.info("==================================================");
-    
+
     const storageStateObject = this.authSource.getAuth(authIndex);
     if (!storageStateObject) {
-      throw new Error(`Failed to get or parse auth source for index ${authIndex}.`);
+      throw new Error(
+        `Failed to get or parse auth source for index ${authIndex}.`
+      );
     }
-    const buildScriptContent = fs.readFileSync(path.join(__dirname, this.scriptFileName), "utf-8");
+    const buildScriptContent = fs.readFileSync(
+      path.join(__dirname, this.scriptFileName),
+      "utf-8"
+    );
 
     try {
-      this.context = await this.browser.newContext({ storageState: storageStateObject, viewport: { width: 1920, height: 1080 } });
+      this.context = await this.browser.newContext({
+        storageState: storageStateObject,
+        viewport: { width: 1920, height: 1080 },
+      });
       this.page = await this.context.newPage();
       this.page.on("console", (msg) => {
         const msgText = msg.text();
         if (msgText.includes("[ProxyClient]")) {
-          this.logger.info(`[Browser] ${msgText.replace("[ProxyClient] ", "")}`);
+          this.logger.info(
+            `[Browser] ${msgText.replace("[ProxyClient] ", "")}`
+          );
         } else if (msg.type() === "error") {
           this.logger.error(`[Browser Page Error] ${msgText}`);
         }
       });
 
       this.logger.info(`[Browser] 正在导航至目标网页...`);
-      const targetUrl = "https://aistudio.google.com/u/0/apps/bundled/blank?showPreview=true&showCode=true&showAssistant=true";
-      await this.page.goto(targetUrl, { timeout: 180000, waitUntil: "domcontentloaded" });
+      const targetUrl =
+        "https://aistudio.google.com/u/0/apps/bundled/blank?showPreview=true&showCode=true&showAssistant=true";
+      await this.page.goto(targetUrl, {
+        timeout: 180000,
+        waitUntil: "domcontentloaded",
+      });
       this.logger.info("[Browser] 页面加载完成。");
 
       // [优化] 在进行任何操作前，先给页面一个“呼吸”的时间，等待JS加载
@@ -261,34 +289,49 @@ class BrowserManager {
       // [核心修改] 回归最简洁的逻辑：只处理 "Got it" 弹窗
       this.logger.info(`[Browser] 正在检查 "Got it" 弹窗...`);
       try {
-        const gotItButton = this.page.locator('div.dialog button:text("Got it")');
+        const gotItButton = this.page.locator(
+          'div.dialog button:text("Got it")'
+        );
         // 等待按钮出现，如果10秒内没有，就认为不存在
-        await gotItButton.waitFor({ state: 'visible', timeout: 10000 });
+        await gotItButton.waitFor({ state: "visible", timeout: 10000 });
         this.logger.info(`[Browser] ✅ 发现 "Got it" 弹窗，正在点击...`);
         await gotItButton.click({ force: true });
-        
+
         // [核心修改] 严格按照您的要求：点击后，固定等待一个较长的时间，让所有动画结束
         this.logger.info(`[Browser] "Got it" 已点击，等待8秒让页面稳定...`);
         await this.page.waitForTimeout(8000);
-
       } catch (error) {
         this.logger.info(`[Browser] 未发现 "Got it" 弹窗，跳过。`);
       }
 
-      this.logger.info('[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...');
+      this.logger.info(
+        '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
+      );
       await this.page.locator('button:text("Code")').click({ timeout: 20000 }); // 增加点击超时
-      
-      this.logger.info('[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...');
-      const editorContainerLocator = this.page.locator("div.monaco-editor").first();
-      await editorContainerLocator.waitFor({ state: "visible", timeout: 60000 });
+
+      this.logger.info(
+        '[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...'
+      );
+      const editorContainerLocator = this.page
+        .locator("div.monaco-editor")
+        .first();
+      await editorContainerLocator.waitFor({
+        state: "visible",
+        timeout: 60000,
+      });
       this.logger.info("[Browser] (步骤3/5) 编辑器已显示，聚焦并粘贴脚本...");
       await editorContainerLocator.click();
-      await this.page.evaluate((text) => navigator.clipboard.writeText(text), buildScriptContent);
+      await this.page.evaluate(
+        (text) => navigator.clipboard.writeText(text),
+        buildScriptContent
+      );
       const isMac = os.platform() === "darwin";
       const pasteKey = isMac ? "Meta+V" : "Control+V";
       await this.page.keyboard.press(pasteKey);
       this.logger.info("[Browser] (步骤4/5) 脚本已粘贴。");
-      this.logger.info('[Browser] (步骤5/5) 正在点击 "Preview" 按钮以使脚本生效...');
+      this.logger.info(
+        '[Browser] (步骤5/5) 正在点击 "Preview" 按钮以使脚本生效...'
+      );
       await this.page.locator('button:text("Preview")').click();
       this.logger.info("[Browser] ✅ UI交互完成，脚本已开始运行。");
       this.currentAuthIndex = authIndex;
@@ -296,10 +339,14 @@ class BrowserManager {
       this.logger.info(`✅ [Browser] 账号 ${authIndex} 的上下文初始化成功！`);
       this.logger.info("✅ [Browser] 浏览器客户端已准备就绪。");
       this.logger.info("==================================================");
-
     } catch (error) {
-      this.logger.error(`❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`);
-      if (this.browser) { await this.browser.close(); this.browser = null; }
+      this.logger.error(
+        `❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`
+      );
+      if (this.browser) {
+        await this.browser.close();
+        this.browser = null;
+      }
       throw error;
     }
   }
@@ -308,15 +355,21 @@ class BrowserManager {
     if (this.browser) {
       this.logger.info("[Browser] 正在关闭整个浏览器实例...");
       await this.browser.close();
-      this.browser = null; this.context = null; this.page = null;
+      this.browser = null;
+      this.context = null;
+      this.page = null;
       this.logger.info("[Browser] 浏览器实例已关闭。");
     }
   }
 
   async switchAccount(newAuthIndex) {
-    this.logger.info(`🔄 [Browser] 开始账号切换: 从 ${this.currentAuthIndex} 到 ${newAuthIndex}`);
+    this.logger.info(
+      `🔄 [Browser] 开始账号切换: 从 ${this.currentAuthIndex} 到 ${newAuthIndex}`
+    );
     await this.launchOrSwitchContext(newAuthIndex);
-    this.logger.info(`✅ [Browser] 账号切换完成，当前账号: ${this.currentAuthIndex}`);
+    this.logger.info(
+      `✅ [Browser] 账号切换完成，当前账号: ${this.currentAuthIndex}`
+    );
   }
 }
 
@@ -336,7 +389,7 @@ class LoggingService {
     const formatted = `[${level}] ${timestamp} [${this.serviceName}] - ${message}`;
 
     // 将格式化后的日志存入缓冲区
-   this.logBuffer.push(formatted);
+    this.logBuffer.push(formatted);
     // 如果缓冲区超过最大长度，则从头部删除旧的日志
     if (this.logBuffer.length > this.maxBufferSize) {
       this.logBuffer.shift();
@@ -624,6 +677,41 @@ class RequestHandler {
       }
     } finally {
       // --- 解锁！---
+      this.isAuthSwitching = false;
+      this.isSystemBusy = false;
+    }
+  }
+
+  async _switchToSpecificAuth(targetIndex) {
+    if (this.isAuthSwitching) {
+      this.logger.info("🔄 [Auth] 正在切换账号，跳过重复操作");
+      return { success: false, reason: "Switch already in progress." };
+    }
+    if (!this.authSource.availableIndices.includes(targetIndex)) {
+      return {
+        success: false,
+        reason: `切换失败：账号 #${targetIndex} 无效或不存在。`,
+      };
+    }
+
+    this.isSystemBusy = true;
+    this.isAuthSwitching = true;
+    try {
+      this.logger.info(`🔄 [Auth] 开始切换到指定账号 #${targetIndex}...`);
+      await this.browserManager.switchAccount(targetIndex);
+      this.failureCount = 0;
+      this.usageCount = 0;
+      this.logger.info(
+        `✅ [Auth] 成功切换到账号 #${this.currentAuthIndex}，计数已重置。`
+      );
+      return { success: true, newIndex: this.currentAuthIndex };
+    } catch (error) {
+      this.logger.error(
+        `❌ [Auth] 切换到指定账号 #${targetIndex} 失败: ${error.message}`
+      );
+      // 对于指定切换，失败了就直接报错，不进行回退，让用户知道这个账号有问题
+      throw error;
+    } finally {
       this.isAuthSwitching = false;
       this.isSystemBusy = false;
     }
@@ -1551,8 +1639,13 @@ class ProxyServerSystem extends EventEmitter {
             </div>
             <div id="actions-section" style="margin-top: 2em;">
                 <h2>操作面板</h2>
-                <button onclick="switchAccount()">切换账号</button>
-                <button onclick="toggleStreamingMode()">切换流模式</button>
+                <div style="display: flex; flex-wrap: wrap; gap: 15px; align-items: center;">
+                    <div>
+                        <input type="number" id="accountIndexInput" placeholder="账号ID" style="padding: 10px; border-radius: 8px; border: 1px solid #ccc; width: 80px;"/>
+                        <button onclick="switchAccount()">切换账号</button>
+                    </div>
+                    <button onclick="toggleStreamingMode()">切换流模式</button>
+                </div>
             </div>
           </div>
           <script>
@@ -1583,10 +1676,52 @@ class ProxyServerSystem extends EventEmitter {
                   if (isScrolledToBottom) { logContainer.scrollTop = logContainer.scrollHeight; }
                 }).catch(error => console.error('Error fetching new content:', error));
             }
-            function switchAccount() { if (!confirm('确定要切换到下一个账号吗？')) return; fetch('/api/switch-account', { method: 'POST' }).then(res => res.text()).then(data => { alert(data); updateContent(); }).catch(err => alert('切换失败: ' + err)); }
-            function toggleStreamingMode() { const newMode = prompt('请输入新的流模式 (fake 或 real):', '${
-              this.streamingMode
-            }'); if (newMode === 'fake' || newMode === 'real') { fetch('/api/set-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: newMode }) }).then(res => res.text()).then(data => { alert(data); updateContent(); }).catch(err => alert('设置失败: ' + err)); } else if (newMode !== null) { alert('无效的模式！'); } }
+            
+            function switchAccount() {
+                const targetIndex = document.getElementById('accountIndexInput').value;
+                let confirmationMessage = '';
+                let apiBody = null;
+                if (targetIndex) {
+                     confirmationMessage = \`确定要切换到账号 #\${targetIndex} 吗？这会重置浏览器会话。\`;
+                     apiBody = JSON.stringify({ targetIndex: parseInt(targetIndex, 10) });
+                } else {
+                     confirmationMessage = '未指定账号ID，确定要切换到下一个可用账号吗？';
+                     apiBody = JSON.stringify({});
+                }
+                if (!confirm(confirmationMessage)) return;
+                fetch('/api/switch-account', {
+                     method: 'POST',
+                     headers: { 'Content-Type': 'application/json' },
+                     body: apiBody
+                })
+                .then(res => res.text())
+                .then(data => {
+                    alert(data);
+                    updateContent();
+                })
+                .catch(err => alert('操作失败: ' + err));
+            }
+
+            function toggleStreamingMode() { 
+                const newMode = prompt('请输入新的流模式 (fake 或 real):', '${
+                  this.streamingMode
+                }');
+                if (newMode === 'fake' || newMode === 'real') {
+                    fetch('/api/set-mode', { 
+                        method: 'POST', 
+                        headers: { 'Content-Type': 'application/json' }, 
+                        body: JSON.stringify({ mode: newMode }) 
+                    })
+                    .then(res => res.text())
+                    .then(data => { 
+                        alert(data); 
+                        updateContent(); 
+                    })
+                    .catch(err => alert('设置失败: ' + err));
+                } else if (newMode !== null) { 
+                    alert('无效的模式！'); 
+                } 
+            }
             document.addEventListener('DOMContentLoaded', () => { updateContent(); setInterval(updateContent, 5000); });
           </script>
         </body>
@@ -1642,27 +1777,47 @@ class ProxyServerSystem extends EventEmitter {
     });
 
     app.post("/api/switch-account", isAuthenticated, async (req, res) => {
-      this.logger.info("[WebUI] 收到手动切换账号请求...");
-      if (this.authSource.availableIndices.length <= 1) {
-        return res
-          .status(400)
-          .send("切换操作已取消：只有一个可用账号，无法切换。");
-      }
       try {
-        const result = await this.requestHandler._switchToNextAuth();
-        if (result.success) {
-          res.status(200).send(`切换成功！已切换到账号 #${result.newIndex}。`);
-        } else if (result.fallback) {
-          res
-            .status(200)
-            .send(`切换失败，但已成功回退到账号 #${result.newIndex}。`);
+        const { targetIndex } = req.body;
+
+        if (targetIndex !== undefined) {
+          // --- 切换到指定账号的逻辑 ---
+          this.logger.info(
+            `[WebUI] 收到切换到指定账号 #${targetIndex} 的请求...`
+          );
+          const result = await this.requestHandler._switchToSpecificAuth(
+            targetIndex
+          );
+          if (result.success) {
+            res.status(200).send(`切换成功！已激活账号 #${result.newIndex}。`);
+          } else {
+            res.status(400).send(result.reason);
+          }
         } else {
-          res.status(409).send(`操作未执行: ${result.reason}`);
+          // --- 切换到下一个账号的逻辑 (原逻辑) ---
+          this.logger.info("[WebUI] 收到手动切换下一个账号的请求...");
+          if (this.authSource.availableIndices.length <= 1) {
+            return res
+              .status(400)
+              .send("切换操作已取消：只有一个可用账号，无法切换。");
+          }
+          const result = await this.requestHandler._switchToNextAuth();
+          if (result.success) {
+            res
+              .status(200)
+              .send(`切换成功！已切换到账号 #${result.newIndex}。`);
+          } else if (result.fallback) {
+            res
+              .status(200)
+              .send(`切换失败，但已成功回退到账号 #${result.newIndex}。`);
+          } else {
+            res.status(409).send(`操作未执行: ${result.reason}`);
+          }
         }
       } catch (error) {
         res
           .status(500)
-          .send(`致命错误：切换和回退均失败！错误: ${error.message}`);
+          .send(`致命错误：操作失败！请检查日志。错误: ${error.message}`);
       }
     });
 
@@ -1693,6 +1848,7 @@ class ProxyServerSystem extends EventEmitter {
 
     return app;
   }
+
   async _startWebSocketServer() {
     this.wsServer = new WebSocket.Server({
       port: this.config.wsPort,
@@ -1726,4 +1882,3 @@ if (require.main === module) {
 }
 
 module.exports = { ProxyServerSystem, BrowserManager, initializeServer };
-
