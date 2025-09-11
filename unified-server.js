@@ -297,9 +297,12 @@ class BrowserManager {
         this.logger.info(`[Browser] ✅ 发现 "Got it" 弹窗，正在点击...`);
         await gotItButton.click({ force: true });
 
-        // [核心修改] 严格按照您的要求：点击后，固定等待一个较长的时间，让所有动画结束
-        this.logger.info(`[Browser] "Got it" 已点击，等待8秒让页面稳定...`);
-        await this.page.waitForTimeout(8000);
+        // [更可靠的修复] 等待弹窗背后的遮罩层彻底消失
+        this.logger.info(`[Browser] "Got it" 已点击，正在等待遮罩层消失...`);
+        await this.page
+          .locator("div.cdk-overlay-backdrop")
+          .waitFor({ state: "hidden", timeout: 15000 });
+        this.logger.info(`[Browser] ✅ 遮罩层已消失，页面已稳定。`);
       } catch (error) {
         this.logger.info(`[Browser] 未发现 "Got it" 弹窗，跳过。`);
       }
