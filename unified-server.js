@@ -1265,7 +1265,8 @@ class ProxyServerSystem extends EventEmitter {
       retryDelay: 2000,
       browserExecutablePath: null,
       apiKeys: [],
-      immediateSwitchStatusCodes: [],
+      // [修改#2] 设置默认的状态码
+      immediateSwitchStatusCodes: [429, 503],
     };
 
     const configPath = path.join(__dirname, "config.json");
@@ -1305,13 +1306,14 @@ class ProxyServerSystem extends EventEmitter {
     let rawCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES;
     let codesSource = "环境变量";
 
+    // 注意：这里的逻辑会确保环境变量优先于文件，文件优先于默认值
     if (
       !rawCodes &&
       config.immediateSwitchStatusCodes &&
       Array.isArray(config.immediateSwitchStatusCodes)
     ) {
       rawCodes = config.immediateSwitchStatusCodes.join(",");
-      codesSource = "config.json 文件";
+      codesSource = "config.json 文件或默认值";
     }
 
     if (rawCodes && typeof rawCodes === "string") {
@@ -1332,6 +1334,14 @@ class ProxyServerSystem extends EventEmitter {
         .filter((k) => k);
     } else {
       config.apiKeys = [];
+    }
+
+    // [修改#3] 如果没有设置任何API Key，则启用默认密码
+    if (config.apiKeys.length === 0) {
+      config.apiKeys = ["123456"];
+      this.logger.info(
+        "[System] 未通过环境变量或配置文件设置API Key，已启用默认密码: 123456"
+      );
     }
 
     this.config = config;
@@ -1521,9 +1531,7 @@ class ProxyServerSystem extends EventEmitter {
   _createExpressApp() {
     const app = express();
 
-    // ==========================================================
-    // Section 1: 核心中间件配置 (这部分保持不变)
-    // ==========================================================
+    // Section 1 & 2 (核心中间件和登录路由) 保持不变...
     app.use((req, res, next) => {
       if (
         req.path !== "/api/status" &&
@@ -1557,10 +1565,6 @@ class ProxyServerSystem extends EventEmitter {
       }
       res.redirect("/login");
     };
-
-    // ==========================================================
-    // Section 2: 公开及网页UI路由 (这部分保持不变)
-    // ==========================================================
     app.get("/login", (req, res) => {
       if (req.session.isAuthenticated) {
         return res.redirect("/");
@@ -1575,7 +1579,6 @@ class ProxyServerSystem extends EventEmitter {
       }</form></body></html>`;
       res.send(loginHtml);
     });
-
     app.post("/login", (req, res) => {
       const bodyString = req.body.toString("utf-8");
       const submittedKey = new URLSearchParams(bodyString).get("apiKey");
@@ -1599,7 +1602,6 @@ class ProxyServerSystem extends EventEmitter {
       );
       const logs = this.logger.logBuffer || [];
 
-      // 为下拉列表生成 <option> HTML
       const accountOptionsHtml = availableIndices
         .map((index) => `<option value="${index}">账号 #${index}</option>`)
         .join("");
@@ -1622,12 +1624,12 @@ class ProxyServerSystem extends EventEmitter {
             .label { display: inline-block; width: 220px; }
             .dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-left: 10px; animation: blink 1s infinite alternate; }
             @keyframes blink { from { opacity: 0.3; } to { opacity: 1; } }
+            /* [修改#4] 更新操作面板样式 */
             .action-group { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; }
-            .action-group button, .action-group select { font-size: 1em; color: white; border: none; padding: 10px 15px; border-radius: 8px; cursor: pointer; transition: background-color 0.3s ease; }
-            .action-group button:hover, .action-group select:hover { opacity: 0.85; }
-            .action-group button { background-color: #007bff; }
-            .action-group .btn-secondary { background-color: #6c757d; }
-            .action-group select { background-color: #28a745; color: white; -webkit-appearance: none; appearance: none; text-align: center;}
+            .action-group button, .action-group select { font-size: 1em; border: 1px solid #ccc; padding: 10px 15px; border-radius: 8px; cursor: pointer; transition: background-color 0.3s ease; }
+            .action-group button:hover { opacity: 0.85; }
+            .action-group button { background-color: #007bff; color: white; border-color: #007bff; }
+            .action-group select { background-color: #ffffff; color: #000000; -webkit-appearance: none; appearance: none; }
           </style>
         </head>
         <body>
@@ -1662,17 +1664,17 @@ class ProxyServerSystem extends EventEmitter {
       )}] (总数: ${invalidIndices.length})
               </pre>
             </div>
-             <div id="actions-section" style="margin-top: 2em;">
-                <h2>操作面板</h2>
-                <div class="action-group">
-                    <select id="accountIndexSelect" onchange="switchSpecificAccount()">${accountOptionsHtml}</select>
-                    <button class="btn-secondary" onclick="switchToNextAccount()">切换到下一个</button>
-                    <button onclick="toggleStreamingMode()">切换流模式</button>
-                </div>
-            </div>
             <div id="log-section" style="margin-top: 2em;">
               <h2>实时日志 (最近 ${logs.length} 条)</h2>
               <pre id="log-container">${logs.join("\n")}</pre>
+            </div>
+            <div id="actions-section" style="margin-top: 2em;">
+                <h2>操作面板</h2>
+                <div class="action-group">
+                    <select id="accountIndexSelect">${accountOptionsHtml}</select>
+                    <button onclick="switchSpecificAccount()">切换账号</button>
+                    <button onclick="toggleStreamingMode()">切换流模式</button>
+                </div>
             </div>
           </div>
           <script>
@@ -1692,7 +1694,6 @@ class ProxyServerSystem extends EventEmitter {
 <span class="label">扫描到的总账号</span>: \${data.status.initialIndices}
 <span class="label">格式错误 (已忽略)</span>: \${data.status.invalidIndices}\`;
                   
-                  // 更新下拉列表的选中项以匹配当前账号
                   document.getElementById('accountIndexSelect').value = data.status.currentAuthIndex;
 
                   const logContainer = document.getElementById('log-container');
@@ -1704,29 +1705,17 @@ class ProxyServerSystem extends EventEmitter {
                 }).catch(error => console.error('Error fetching new content:', error));
             }
 
+            // [修改#4] 此函数现在由按钮点击触发
             function switchSpecificAccount() {
                 const selectElement = document.getElementById('accountIndexSelect');
                 const targetIndex = selectElement.value;
                 if (!confirm(\`确定要切换到账号 #\${targetIndex} 吗？这会重置浏览器会话。\`)) {
-                    // 如果用户取消，将下拉列表恢复到当前实际账号
-                    updateContent(); 
                     return;
                 }
                 fetch('/api/switch-account', {
                      method: 'POST',
                      headers: { 'Content-Type': 'application/json' },
                      body: JSON.stringify({ targetIndex: parseInt(targetIndex, 10) })
-                })
-                .then(res => res.text()).then(data => { alert(data); updateContent(); })
-                .catch(err => { alert('操作失败: ' + err); updateContent(); });
-            }
-
-            function switchToNextAccount() {
-                if (!confirm('确定要切换到下一个可用账号吗？')) return;
-                fetch('/api/switch-account', {
-                     method: 'POST',
-                     headers: { 'Content-Type': 'application/json' },
-                     body: JSON.stringify({}) // 发送空对象以触发“下一个”逻辑
                 })
                 .then(res => res.text()).then(data => { alert(data); updateContent(); })
                 .catch(err => { alert('操作失败: ' + err); updateContent(); });
@@ -1750,10 +1739,8 @@ class ProxyServerSystem extends EventEmitter {
             }
 
             document.addEventListener('DOMContentLoaded', () => {
-                // 页面加载时，立即将下拉列表设置为当前账号
                 const selectElement = document.getElementById('accountIndexSelect');
                 selectElement.value = "${requestHandler.currentAuthIndex}";
-                // 启动定时刷新
                 updateContent(); 
                 setInterval(updateContent, 5000);
             });
@@ -1764,6 +1751,7 @@ class ProxyServerSystem extends EventEmitter {
       res.status(200).send(statusHtml);
     });
 
+    // API 路由保持不变...
     app.get("/api/status", isAuthenticated, (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
       const initialIndices = authSource.initialIndices || [];
@@ -1799,7 +1787,6 @@ class ProxyServerSystem extends EventEmitter {
       };
       res.json(data);
     });
-
     app.post("/api/switch-account", isAuthenticated, async (req, res) => {
       try {
         const { targetIndex } = req.body;
@@ -1841,7 +1828,6 @@ class ProxyServerSystem extends EventEmitter {
           .send(`致命错误：操作失败！请检查日志。错误: ${error.message}`);
       }
     });
-
     app.post("/api/set-mode", isAuthenticated, (req, res) => {
       const newMode = req.body.mode;
       if (newMode === "fake" || newMode === "real") {
@@ -1855,9 +1841,7 @@ class ProxyServerSystem extends EventEmitter {
       }
     });
 
-    // ==========================================================
-    // Section 4: 代理主逻辑 (保持不变)
-    // ==========================================================
+    // Section 4 (代理主逻辑) 保持不变...
     app.use(this._createAuthMiddleware());
     app.all(/(.*)/, (req, res) => {
       this.requestHandler.processRequest(req, res);
