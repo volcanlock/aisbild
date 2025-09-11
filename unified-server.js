@@ -313,8 +313,15 @@ class BrowserManager {
         }
       });
       // 加一个极短的暂停，确保DOM更新完成
-      await this.page.waitForTimeout(500);
-      this.logger.info("[Browser] ✅ 确认页面无遮罩层。");
+      this.logger.info(
+        '[Browser] (清场 #1) 准备点击"Code"，强行移除所有可能的遮罩层...'
+      );
+      await this.page.evaluate(() => {
+        document
+          .querySelectorAll("div.cdk-overlay-backdrop")
+          .forEach((el) => el.remove());
+      });
+      await this.page.waitForTimeout(250); // 短暂等待DOM更新
 
       this.logger.info(
         '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
@@ -331,8 +338,25 @@ class BrowserManager {
         state: "visible",
         timeout: 60000,
       });
+
+      // [清场动作 #2] 在点击编辑器前，再次移除所有可能新生成的遮罩层
+      this.logger.info(
+        "[Browser] (清场 #2) 准备点击编辑器，再次强行移除所有可能的遮罩层..."
+      );
+      await this.page.evaluate(() => {
+        const overlays = document.querySelectorAll("div.cdk-overlay-backdrop");
+        if (overlays.length > 0) {
+          console.log(
+            `[ProxyClient] (内部JS) 发现并移除了 ${overlays.length} 个新出现的遮罩层。`
+          );
+          overlays.forEach((el) => el.remove());
+        }
+      });
+      await this.page.waitForTimeout(250); // 短暂等待DOM更新
+
       this.logger.info("[Browser] (步骤3/5) 编辑器已显示，聚焦并粘贴脚本...");
-      await editorContainerLocator.click();
+      await editorContainerLocator.click({ timeout: 30000 });
+
       await this.page.evaluate(
         (text) => navigator.clipboard.writeText(text),
         buildScriptContent
