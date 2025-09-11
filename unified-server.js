@@ -300,21 +300,20 @@ class BrowserManager {
       }
 
       // [最终稳定版修复] 不论之前发生了什么，在进行关键交互前，统一等待所有可能的遮罩层消失
-      this.logger.info("[Browser] 准备UI交互，开始检查并等待所有遮罩层消失...");
-      // 使用循环来处理可能存在的多个遮罩层，避免严格模式冲突
-      const overlays = await this.page
-        .locator("div.cdk-overlay-backdrop")
-        .all();
-      if (overlays.length > 0) {
-        this.logger.info(
-          `[Browser] 检测到 ${overlays.length} 个遮罩层，将逐一等待它们消失...`
-        );
-        await Promise.all(
-          overlays.map((overlay) =>
-            overlay.waitFor({ state: "hidden", timeout: 15000 })
-          )
-        );
-      }
+      this.logger.info("[Browser] 准备UI交互，强行移除所有可能的遮罩层...");
+
+      // 使用 page.evaluate 执行JS，找到所有遮罩层并直接删除它们
+      await this.page.evaluate(() => {
+        const overlays = document.querySelectorAll("div.cdk-overlay-backdrop");
+        if (overlays.length > 0) {
+          console.log(
+            `[ProxyClient] (内部JS) 发现并移除了 ${overlays.length} 个遮罩层。`
+          );
+          overlays.forEach((el) => el.remove());
+        }
+      });
+      // 加一个极短的暂停，确保DOM更新完成
+      await this.page.waitForTimeout(500);
       this.logger.info("[Browser] ✅ 确认页面无遮罩层。");
 
       this.logger.info(
