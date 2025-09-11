@@ -227,7 +227,10 @@ class RequestProcessor {
     ) {
       try {
         let bodyObj = JSON.parse(requestSpec.body);
-        const isImageModel = requestSpec.path.includes("-image-");
+
+        const isImageModel =
+          requestSpec.path.includes("-image-") ||
+          requestSpec.path.includes("imagen");
 
         if (isImageModel) {
           const incompatibleKeys = ["tool_config", "tools", "toolChoice"];
