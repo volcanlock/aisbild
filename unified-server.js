@@ -312,22 +312,37 @@ class BrowserManager {
           overlays.forEach((el) => el.remove());
         }
       });
-      // 加一个极短的暂停，确保DOM更新完成
-      this.logger.info(
-        '[Browser] (清场 #1) 准备点击"Code"，强行移除所有可能的遮罩层...'
-      );
-      await this.page.evaluate(() => {
-        document
-          .querySelectorAll("div.cdk-overlay-backdrop")
-          .forEach((el) => el.remove());
-      });
-      await this.page.waitForTimeout(250); // 短暂等待DOM更新
+      this.logger.info('[Browser] (步骤1/5) 准备点击 "Code" 按钮...');
+      const maxRetries = 5;
+      let clickSuccess = false;
+      for (let i = 1; i <= maxRetries; i++) {
+        try {
+          this.logger.info(`  [尝试 ${i}/${maxRetries}] 清理遮罩层并点击...`);
+          // 每次尝试前都强力清除遮罩层
+          await this.page.evaluate(() => {
+            document
+              .querySelectorAll("div.cdk-overlay-backdrop")
+              .forEach((el) => el.remove());
+          });
+          await this.page.waitForTimeout(500); // 清理后短暂等待
 
-      this.logger.info(
-        '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
-      );
-      await this.page.locator('button:text("Code")').click({ timeout: 20000 });
-
+          await this.page
+            .locator('button:text("Code")')
+            .click({ timeout: 10000 }); // 将单次超时缩短
+          clickSuccess = true;
+          this.logger.info("  ✅ 点击成功！");
+          break; // 成功后跳出循环
+        } catch (error) {
+          this.logger.warn(
+            `  [尝试 ${i}/${maxRetries}] 点击失败: ${
+              error.message.split("\n")[0]
+            }`
+          );
+          if (i === maxRetries) {
+            throw new Error(`多次尝试后仍无法点击 "Code" 按钮，初始化失败。`);
+          }
+        }
+      }
       this.logger.info(
         '[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...'
       );
@@ -938,9 +953,9 @@ class RequestHandler {
   }
   _buildProxyRequest(req, requestId) {
     let requestBody = "";
-    if (Buffer.isBuffer(req.body)) requestBody = req.body.toString("utf-8");
-    else if (typeof req.body === "string") requestBody = req.body;
-    else if (req.body) requestBody = JSON.stringify(req.body);
+    if (req.body) {
+      requestBody = JSON.stringify(req.body);
+    }
     return {
       path: req.path,
       method: req.method,
@@ -1525,8 +1540,8 @@ class ProxyServerSystem extends EventEmitter {
 
   _createExpressApp() {
     const app = express();
-
-    // Section 1 & 2 (核心中间件和登录路由) 保持不变...
+    app.use(express.json({ limit: "100mb" }));
+    app.use(express.urlencoded({ extended: true }));
     app.use((req, res, next) => {
       if (
         req.path !== "/api/status" &&
@@ -1540,9 +1555,8 @@ class ProxyServerSystem extends EventEmitter {
       }
       next();
     });
-    app.use(express.json({ limit: "100mb" }));
-    app.use(express.raw({ type: "*/*", limit: "100mb" }));
     const sessionSecret =
+      // Section 1 & 2 (核心中间件和登录路由) 保持不变...
       (this.config.apiKeys && this.config.apiKeys[0]) ||
       crypto.randomBytes(20).toString("hex");
     app.use(cookieParser());
@@ -1575,9 +1589,8 @@ class ProxyServerSystem extends EventEmitter {
       res.send(loginHtml);
     });
     app.post("/login", (req, res) => {
-      const bodyString = req.body.toString("utf-8");
-      const submittedKey = new URLSearchParams(bodyString).get("apiKey");
-      if (submittedKey && this.config.apiKeys.includes(submittedKey)) {
+      const { apiKey } = req.body;
+      if (apiKey && this.config.apiKeys.includes(apiKey)) {
         req.session.isAuthenticated = true;
         res.redirect("/");
       } else {
