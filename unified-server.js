@@ -292,7 +292,7 @@ class BrowserManager {
         const gotItButton = this.page.locator(
           'div.dialog button:text("Got it")'
         );
-        await gotItButton.waitFor({ state: "visible", timeout: 10000 });
+        await gotItButton.waitFor({ state: "visible", timeout: 15000 });
         this.logger.info(`[Browser] ✅ 发现 "Got it" 弹窗，正在点击...`);
         await gotItButton.click({ force: true });
       } catch (error) {
@@ -301,9 +301,20 @@ class BrowserManager {
 
       // [最终稳定版修复] 不论之前发生了什么，在进行关键交互前，统一等待所有可能的遮罩层消失
       this.logger.info("[Browser] 准备UI交互，开始检查并等待所有遮罩层消失...");
-      await this.page
+      // 使用循环来处理可能存在的多个遮罩层，避免严格模式冲突
+      const overlays = await this.page
         .locator("div.cdk-overlay-backdrop")
-        .waitFor({ state: "hidden", timeout: 15000 });
+        .all();
+      if (overlays.length > 0) {
+        this.logger.info(
+          `[Browser] 检测到 ${overlays.length} 个遮罩层，将逐一等待它们消失...`
+        );
+        await Promise.all(
+          overlays.map((overlay) =>
+            overlay.waitFor({ state: "hidden", timeout: 15000 })
+          )
+        );
+      }
       this.logger.info("[Browser] ✅ 确认页面无遮罩层。");
 
       this.logger.info(
