@@ -292,25 +292,24 @@ class BrowserManager {
         const gotItButton = this.page.locator(
           'div.dialog button:text("Got it")'
         );
-        // 等待按钮出现，如果10秒内没有，就认为不存在
         await gotItButton.waitFor({ state: "visible", timeout: 10000 });
         this.logger.info(`[Browser] ✅ 发现 "Got it" 弹窗，正在点击...`);
         await gotItButton.click({ force: true });
-
-        // [更可靠的修复] 等待弹窗背后的遮罩层彻底消失
-        this.logger.info(`[Browser] "Got it" 已点击，正在等待遮罩层消失...`);
-        await this.page
-          .locator("div.cdk-overlay-backdrop")
-          .waitFor({ state: "hidden", timeout: 15000 });
-        this.logger.info(`[Browser] ✅ 遮罩层已消失，页面已稳定。`);
       } catch (error) {
         this.logger.info(`[Browser] 未发现 "Got it" 弹窗，跳过。`);
       }
 
+      // [最终稳定版修复] 不论之前发生了什么，在进行关键交互前，统一等待所有可能的遮罩层消失
+      this.logger.info("[Browser] 准备UI交互，开始检查并等待所有遮罩层消失...");
+      await this.page
+        .locator("div.cdk-overlay-backdrop")
+        .waitFor({ state: "hidden", timeout: 15000 });
+      this.logger.info("[Browser] ✅ 确认页面无遮罩层。");
+
       this.logger.info(
         '[Browser] (步骤1/5) 正在点击 "Code" 按钮以显示编辑器...'
       );
-      await this.page.locator('button:text("Code")').click({ timeout: 20000 }); // 增加点击超时
+      await this.page.locator('button:text("Code")').click({ timeout: 20000 });
 
       this.logger.info(
         '[Browser] (步骤2/5) "Code" 按钮点击成功，等待编辑器变为可见...'
@@ -1441,10 +1440,13 @@ class ProxyServerSystem extends EventEmitter {
 
       // 对于没有有效API Key的请求，返回401错误
       // 注意：健康检查等逻辑已在_createExpressApp中提前处理
-      const clientIp = req.headers["x-forwarded-for"] || req.ip;
-      this.logger.warn(
-        `[Auth] 访问密码错误或缺失，已拒绝请求。IP: ${clientIp}, Path: ${req.path}`
-      );
+      if (req.path !== "/favicon.ico") {
+        const clientIp = req.headers["x-forwarded-for"] || req.ip;
+        this.logger.warn(
+          `[Auth] 访问密码错误或缺失，已拒绝请求。IP: ${clientIp}, Path: ${req.path}`
+        );
+      }
+
       return res.status(401).json({
         error: {
           message:
