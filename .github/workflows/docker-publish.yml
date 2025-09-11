@@ -7,7 +7,7 @@ on:
       version:
         description: "Docker image version tag (e.g., v1.0, v1.1-alpha)"
         required: true
-        default: "v2"
+        default: "latest"
       update_latest:
         description: 'Update the "latest" tag as well?'
         type: boolean
