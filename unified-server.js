@@ -839,7 +839,6 @@ class RequestHandler {
     });
 
     if (!this.connectionRegistry.hasActiveConnections()) {
-      // --- 在恢复前，检查“总锁” ---
       if (this.isSystemBusy) {
         this.logger.warn(
           "[System] 检测到连接断开，但系统正在进行切换/恢复，拒绝新请求。"
@@ -899,18 +898,33 @@ class RequestHandler {
 
     const proxyRequest = this._buildProxyRequest(req, requestId);
     proxyRequest.is_generative = isGenerativeRequest;
+    // 根据判断结果，为浏览器脚本准备标志位
     const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
+    const wantsStreamByHeader =
+      req.headers.accept && req.headers.accept.includes("text/event-stream");
+    const wantsStreamByPath = req.path.includes(":streamGenerateContent");
+    const wantsStream = wantsStreamByHeader || wantsStreamByPath;
+    proxyRequest.client_wants_stream = wantsStream;
 
     try {
-      if (this.serverSystem.streamingMode === "fake") {
-        await this._handlePseudoStreamResponse(
-          proxyRequest,
-          messageQueue,
-          req,
-          res
-        );
+      if (wantsStream) {
+        // --- 客户端想要流式响应 ---
+        this.logger.info("[Request] 客户端启用流式传输，进入流式处理模式...");
+        if (this.serverSystem.streamingMode === "fake") {
+          await this._handlePseudoStreamResponse(
+            proxyRequest,
+            messageQueue,
+            req,
+            res
+          );
+        } else {
+          await this._handleRealStreamResponse(proxyRequest, messageQueue, res);
+        }
       } else {
-        await this._handleRealStreamResponse(proxyRequest, messageQueue, res);
+        // --- 客户端想要非流式响应 ---
+        // 明确告知浏览器脚本本次应按“一次性JSON”（即fake模式）来处理
+        proxyRequest.streaming_mode = "fake";
+        await this._handleNonStreamResponse(proxyRequest, messageQueue, res);
       }
     } catch (error) {
       this._handleRequestError(error, res);
@@ -1170,6 +1184,74 @@ class RequestHandler {
     }
   }
 
+  async _handleNonStreamResponse(proxyRequest, messageQueue, res) {
+    this.logger.info(`[Request] 客户端请求非流式响应，启动标准处理模式...`);
+
+    // 转发请求到浏览器端，这部分和流式逻辑完全一样
+    this._forwardRequest(proxyRequest);
+
+    try {
+      // 1. 等待响应头信息
+      const headerMessage = await messageQueue.dequeue();
+      if (headerMessage.event_type === "error") {
+        // 如果浏览器端直接返回错误（如用户取消），则提前结束
+        if (
+          headerMessage.message &&
+          headerMessage.message.includes("The user aborted a request")
+        ) {
+          this.logger.info(
+            `[Request] 请求 #${proxyRequest.request_id} 已被用户妥善取消。`
+          );
+        } else {
+          this.logger.error(
+            `[Request] 浏览器端返回错误: ${headerMessage.message}`
+          );
+          await this._handleRequestFailureAndSwitch(headerMessage, null);
+        }
+        // 对于非流式请求，即使是错误，也最好返回一个标准的JSON错误体
+        return this._sendErrorResponse(
+          res,
+          headerMessage.status || 500,
+          headerMessage.message
+        );
+      }
+
+      // 2. 准备一个缓冲区，用于拼接所有数据块
+      let fullBody = "";
+      let finalMessage;
+
+      // 3. 循环接收数据，直到收到结束信号
+      while (true) {
+        const dataMessage = await messageQueue.dequeue(300000); // 300秒超时
+        if (dataMessage.type === "STREAM_END") {
+          this.logger.info("[Request] 收到流结束信号，数据接收完毕。");
+          break;
+        }
+        if (dataMessage.data) {
+          fullBody += dataMessage.data;
+        }
+        finalMessage = dataMessage; // 保存最后一条消息用于诊断
+      }
+
+      // 4. 重置失败计数器（如果需要）
+      if (proxyRequest.is_generative && this.failureCount > 0) {
+        this.logger.info(
+          `✅ [Auth] 非流式生成请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
+        );
+        this.failureCount = 0;
+      }
+
+      // 5. 设置正确的JSON响应头，并一次性发送全部数据
+      res
+        .status(headerMessage.status || 200)
+        .type("application/json")
+        .send(fullBody);
+      this.logger.info(`[Request] 已向客户端发送完整的非流式JSON响应。`);
+    } catch (error) {
+      this._handleRequestError(error, res);
+    }
+  }
+
   _getKeepAliveChunk(req) {
     if (req.path.includes("chat/completions")) {
       const payload = {
@@ -1273,7 +1355,7 @@ class ProxyServerSystem extends EventEmitter {
       httpPort: 7860,
       host: "0.0.0.0",
       wsPort: 9998,
-      streamingMode: "fake",
+      streamingMode: "real",
       failureThreshold: 3,
       switchOnUses: 40,
       maxRetries: 1,
@@ -1616,41 +1698,43 @@ class ProxyServerSystem extends EventEmitter {
         .join("");
 
       const statusHtml = `
-        <!DOCTYPE html>
-        <html lang="zh-CN">
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>代理服务状态</title>
-          <style>
-            body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background-color: #f0f2f5; color: #333; padding: 2em; }
-            .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 1em 2em 2em 2em; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            h1, h2 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 0.5em;}
-            pre { background: #2d2d2d; color: #f0f0f0; font-size: 1.1em; padding: 1.5em; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
-            #log-container { font-size: 0.9em; max-height: 400px; overflow-y: auto; }
-            .status-ok { color: #2ecc71; font-weight: bold; }
-            .status-error { color: #e74c3c; font-weight: bold; }
-            .label { display: inline-block; width: 220px; }
-            .dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-left: 10px; animation: blink 1s infinite alternate; }
-            @keyframes blink { from { opacity: 0.3; } to { opacity: 1; } }
-            .action-group { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; }
-            .action-group button, .action-group select { font-size: 1em; border: 1px solid #ccc; padding: 10px 15px; border-radius: 8px; cursor: pointer; transition: background-color 0.3s ease; }
-            .action-group button:hover { opacity: 0.85; }
-            .action-group button { background-color: #007bff; color: white; border-color: #007bff; }
-            .action-group select { background-color: #ffffff; color: #000000; -webkit-appearance: none; appearance: none; }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <h1>代理服务状态 <span class="dot" title="数据动态刷新中..."></span></h1>
-            <div id="status-section">
-              <pre>
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>代理服务状态</title>
+        <style>
+        body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background-color: #f0f2f5; color: #333; padding: 2em; }
+        .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 1em 2em 2em 2em; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1, h2 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 0.5em;}
+        pre { background: #2d2d2d; color: #f0f0f0; font-size: 1.1em; padding: 1.5em; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
+        #log-container { font-size: 0.9em; max-height: 400px; overflow-y: auto; }
+        .status-ok { color: #2ecc71; font-weight: bold; }
+        .status-error { color: #e74c3c; font-weight: bold; }
+        .label { display: inline-block; width: 220px; }
+        .dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-left: 10px; animation: blink 1s infinite alternate; }
+        @keyframes blink { from { opacity: 0.3; } to { opacity: 1; } }
+        .action-group { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; }
+        .action-group button, .action-group select { font-size: 1em; border: 1px solid #ccc; padding: 10px 15px; border-radius: 8px; cursor: pointer; transition: background-color 0.3s ease; }
+        .action-group button:hover { opacity: 0.85; }
+        .action-group button { background-color: #007bff; color: white; border-color: #007bff; }
+        .action-group select { background-color: #ffffff; color: #000000; -webkit-appearance: none; appearance: none; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+        <h1>代理服务状态 <span class="dot" title="数据动态刷新中..."></span></h1>
+        <div id="status-section">
+            <pre>
 <span class="label">服务状态</span>: <span class="status-ok">Running</span>
 <span class="label">浏览器连接</span>: <span class="${
         browserManager.browser ? "status-ok" : "status-error"
       }">${!!browserManager.browser}</span>
 --- 服务配置 ---
-<span class="label">流式模式</span>: ${config.streamingMode}
+<span class="label">流模式</span>: ${
+        config.streamingMode
+      } (仅启用流式传输时生效)
 <span class="label">立即切换 (状态码)</span>: ${
         config.immediateSwitchStatusCodes.length > 0
           ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
@@ -1671,30 +1755,30 @@ class ProxyServerSystem extends EventEmitter {
 <span class="label">格式错误 (已忽略)</span>: [${invalidIndices.join(
         ", "
       )}] (总数: ${invalidIndices.length})
-              </pre>
+            </pre>
+        </div>
+        <div id="log-section" style="margin-top: 2em;">
+            <h2>实时日志 (最近 ${logs.length} 条)</h2>
+            <pre id="log-container">${logs.join("\n")}</pre>
+        </div>
+        <div id="actions-section" style="margin-top: 2em;">
+            <h2>操作面板</h2>
+            <div class="action-group">
+                <select id="accountIndexSelect">${accountOptionsHtml}</select>
+                <button onclick="switchSpecificAccount()">切换账号</button>
+                <button onclick="toggleStreamingMode()">切换流模式</button>
             </div>
-            <div id="log-section" style="margin-top: 2em;">
-              <h2>实时日志 (最近 ${logs.length} 条)</h2>
-              <pre id="log-container">${logs.join("\n")}</pre>
-            </div>
-            <div id="actions-section" style="margin-top: 2em;">
-                <h2>操作面板</h2>
-                <div class="action-group">
-                    <select id="accountIndexSelect">${accountOptionsHtml}</select>
-                    <button onclick="switchSpecificAccount()">切换账号</button>
-                    <button onclick="toggleStreamingMode()">切换流模式</button>
-                </div>
-            </div>
-          </div>
-          <script>
-            function updateContent() {
-              fetch('/api/status').then(response => response.json()).then(data => {
-                  const statusPre = document.querySelector('#status-section pre');
-                  statusPre.innerHTML = \`
+        </div>
+        </div>
+        <script>
+        function updateContent() {
+            fetch('/api/status').then(response => response.json()).then(data => {
+                const statusPre = document.querySelector('#status-section pre');
+                statusPre.innerHTML = \`
 <span class="label">服务状态</span>: <span class="status-ok">Running</span>
 <span class="label">浏览器连接</span>: <span class="\${data.status.browserConnected ? "status-ok" : "status-error"}">\${data.status.browserConnected}</span>
 --- 服务配置 ---
-<span class="label">流式模式</span>: \${data.status.streamingMode}
+<span class="label">流模式</span>: \${data.status.streamingMode}
 <span class="label">立即切换 (状态码)</span>: \${data.status.immediateSwitchStatusCodes}
 <span class="label">API 密钥</span>: \${data.status.apiKeySource}
 --- 账号状态 ---
@@ -1703,62 +1787,56 @@ class ProxyServerSystem extends EventEmitter {
 <span class="label">连续失败计数</span>: \${data.status.failureCount}
 <span class="label">扫描到的总账号</span>: \${data.status.initialIndices}
 <span class="label">格式错误 (已忽略)</span>: \${data.status.invalidIndices}\`;
-                  
-                  // [修改] 删除此行，不再强制同步下拉框的显示
-                  // document.getElementById('accountIndexSelect').value = data.status.currentAuthIndex;
+                
+                const logContainer = document.getElementById('log-container');
+                const logTitle = document.querySelector('#log-section h2');
+                const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 1;
+                logTitle.innerText = \`实时日志 (最近 \${data.logCount} 条)\`;
+                logContainer.innerText = data.logs;
+                if (isScrolledToBottom) { logContainer.scrollTop = logContainer.scrollHeight; }
+            }).catch(error => console.error('Error fetching new content:', error));
+        }
 
-                  const logContainer = document.getElementById('log-container');
-                  const logTitle = document.querySelector('#log-section h2');
-                  const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 1;
-                  logTitle.innerText = \`实时日志 (最近 \${data.logCount} 条)\`;
-                  logContainer.innerText = data.logs;
-                  if (isScrolledToBottom) { logContainer.scrollTop = logContainer.scrollHeight; }
-                }).catch(error => console.error('Error fetching new content:', error));
+        function switchSpecificAccount() {
+            const selectElement = document.getElementById('accountIndexSelect');
+            const targetIndex = selectElement.value;
+            if (!confirm(\`确定要切换到账号 #\${targetIndex} 吗？这会重置浏览器会话。\`)) {
+                return;
             }
+            fetch('/api/switch-account', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ targetIndex: parseInt(targetIndex, 10) })
+            })
+            .then(res => res.text()).then(data => { alert(data); updateContent(); })
+            .catch(err => { alert('操作失败: ' + err); updateContent(); });
+        }
 
-            function switchSpecificAccount() {
-                const selectElement = document.getElementById('accountIndexSelect');
-                const targetIndex = selectElement.value;
-                if (!confirm(\`确定要切换到账号 #\${targetIndex} 吗？这会重置浏览器会话。\`)) {
-                    return;
-                }
-                fetch('/api/switch-account', {
-                     method: 'POST',
-                     headers: { 'Content-Type': 'application/json' },
-                     body: JSON.stringify({ targetIndex: parseInt(targetIndex, 10) })
+        function toggleStreamingMode() { 
+            const newMode = prompt('请输入新的流模式 (real 或 fake):', '${
+              this.config.streamingMode
+            }');
+            if (newMode === 'fake' || newMode === 'real') {
+                fetch('/api/set-mode', { 
+                    method: 'POST', 
+                    headers: { 'Content-Type': 'application/json' }, 
+                    body: JSON.stringify({ mode: newMode }) 
                 })
                 .then(res => res.text()).then(data => { alert(data); updateContent(); })
-                .catch(err => { alert('操作失败: ' + err); updateContent(); });
-            }
+                .catch(err => alert('设置失败: ' + err));
+            } else if (newMode !== null) { 
+                alert('无效的模式！请只输入 "real" 或 "fake"。'); 
+            } 
+        }
 
-            function toggleStreamingMode() { 
-                const newMode = prompt('请输入新的流模式 (fake 或 real):', '${
-                  this.streamingMode
-                }');
-                if (newMode === 'fake' || newMode === 'real') {
-                    fetch('/api/set-mode', { 
-                        method: 'POST', 
-                        headers: { 'Content-Type': 'application/json' }, 
-                        body: JSON.stringify({ mode: newMode }) 
-                    })
-                    .then(res => res.text()).then(data => { alert(data); updateContent(); })
-                    .catch(err => alert('设置失败: ' + err));
-                } else if (newMode !== null) { 
-                    alert('无效的模式！'); 
-                } 
-            }
-
-            document.addEventListener('DOMContentLoaded', () => {
-                // [修改] 删除此行，让下拉框默认显示第一个选项
-                // const selectElement = document.getElementById('accountIndexSelect');
-                // selectElement.value = "${requestHandler.currentAuthIndex}";
-                updateContent(); 
-                setInterval(updateContent, 5000);
-            });
-          </script>
-        </body>
-        </html>
-      `;
+        document.addEventListener('DOMContentLoaded', () => {
+            updateContent(); 
+            setInterval(updateContent, 5000);
+        });
+        </script>
+    </body>
+    </html>
+    `;
       res.status(200).send(statusHtml);
     });
 
@@ -1772,7 +1850,7 @@ class ProxyServerSystem extends EventEmitter {
       const logs = this.logger.logBuffer || [];
       const data = {
         status: {
-          streamingMode: this.streamingMode,
+          streamingMode: `${this.streamingMode} (仅启用流式传输时生效)`,
           browserConnected: !!browserManager.browser,
           immediateSwitchStatusCodes:
             config.immediateSwitchStatusCodes.length > 0
