@@ -1540,8 +1540,6 @@ class ProxyServerSystem extends EventEmitter {
 
   _createExpressApp() {
     const app = express();
-    app.use(express.json({ limit: "100mb" }));
-    app.use(express.urlencoded({ extended: true }));
     app.use((req, res, next) => {
       if (
         req.path !== "/api/status" &&
@@ -1555,6 +1553,9 @@ class ProxyServerSystem extends EventEmitter {
       }
       next();
     });
+    app.use(express.json({ limit: "100mb" }));
+    app.use(express.urlencoded({ extended: true }));
+
     const sessionSecret =
       // Section 1 & 2 (核心中间件和登录路由) 保持不变...
       (this.config.apiKeys && this.config.apiKeys[0]) ||
