@@ -266,9 +266,11 @@ class BrowserManager {
       this.page.on("console", (msg) => {
         const msgText = msg.text();
         if (msgText.includes("[ProxyClient]")) {
-          this.logger.info(
-            `[Browser] ${msgText.replace("[ProxyClient] ", "")}`
+          const cleanMsg = msgText.replace(
+            /\[ProxyClient\]\s\d{2}:\d{2}:\d{2}\.\d{3}\s/,
+            ""
           );
+          this.logger.info(`[Browser] ${cleanMsg}`);
         } else if (msg.type() === "error") {
           this.logger.error(`[Browser Page Error] ${msgText}`);
         }
@@ -285,8 +287,20 @@ class BrowserManager {
 
       // [优化] 在进行任何操作前，先给页面一个“呼吸”的时间，等待JS加载
       await this.page.waitForTimeout(3000);
-
-      // [核心修改] 回归最简洁的逻辑：只处理 "Got it" 弹窗
+      this.logger.info(`[Browser] 正在检查 Cookie 同意横幅...`);
+      try {
+        // 我们寻找文字为 "Agree" 的按钮，并设置一个较短的等待超时
+        const agreeButton = this.page.locator('button:text("Agree")');
+        await agreeButton.waitFor({ state: "visible", timeout: 10000 });
+        this.logger.info(
+          `[Browser] ✅ 发现 Cookie 同意横幅，正在点击 "Agree"...`
+        );
+        await agreeButton.click({ force: true });
+        // 点击后，给横幅一个消失的动画时间
+        await this.page.waitForTimeout(1000);
+      } catch (error) {
+        this.logger.info(`[Browser] 未发现 Cookie 同意横幅，跳过。`);
+      }
       this.logger.info(`[Browser] 正在检查 "Got it" 弹窗...`);
       try {
         const gotItButton = this.page.locator(
@@ -904,12 +918,13 @@ class RequestHandler {
       req.headers.accept && req.headers.accept.includes("text/event-stream");
     const wantsStreamByPath = req.path.includes(":streamGenerateContent");
     const wantsStream = wantsStreamByHeader || wantsStreamByPath;
-    proxyRequest.client_wants_stream = wantsStream;
 
     try {
       if (wantsStream) {
         // --- 客户端想要流式响应 ---
-        this.logger.info("[Request] 客户端启用流式传输，进入流式处理模式...");
+        this.logger.info(
+          `[Request] 客户端启用流式传输 (${this.serverSystem.streamingMode})，进入流式处理模式...`
+        );
         if (this.serverSystem.streamingMode === "fake") {
           await this._handlePseudoStreamResponse(
             proxyRequest,
@@ -938,6 +953,148 @@ class RequestHandler {
           this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
         });
         this.needsSwitchingAfterRequest = false;
+      }
+    }
+  }
+
+  async processOpenAIRequest(req, res) {
+    const requestId = this._generateRequestId();
+    const isOpenAIStream = req.body.stream === true;
+    const model = req.body.model || "gemini-1.5-pro-latest"; // 从请求中获取模型或使用默认
+
+    // 1. 翻译请求体
+    let googleBody;
+    try {
+      googleBody = this._translateOpenAIToGoogle(req.body, model);
+    } catch (error) {
+      this.logger.error(`[Adapter] OpenAI请求翻译失败: ${error.message}`);
+      return this._sendErrorResponse(
+        res,
+        400,
+        "Invalid OpenAI request format."
+      );
+    }
+
+    // 2. 构建代理请求
+    // 决定请求Google的哪个接口（流式或非流式）
+    const googleEndpoint = isOpenAIStream
+      ? "streamGenerateContent"
+      : "generateContent";
+    const proxyRequest = {
+      path: `/v1beta/models/${model}:${googleEndpoint}`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      query_params: isOpenAIStream ? { alt: "sse" } : {},
+      body: JSON.stringify(googleBody),
+      request_id: requestId,
+      streaming_mode: "real", // 对于适配器，我们总是让浏览器端进行真实请求
+      client_wants_stream: true, // 告诉浏览器脚本总是显示模式
+    };
+
+    const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
+
+    // 3. 发送和接收（复用现有逻辑）
+    try {
+      if (isOpenAIStream) {
+        // 设置流式响应头
+        res.status(200).set({
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+
+        this._forwardRequest(proxyRequest);
+        let lastGoogleChunk = "";
+        // 循环接收并翻译响应
+        while (true) {
+          const message = await messageQueue.dequeue(300000); // 5分钟超时
+          if (message.type === "STREAM_END") {
+            res.write("data: [DONE]\n\n");
+            break;
+          }
+          if (message.data) {
+            const translatedChunk = this._translateGoogleToOpenAIStream(
+              message.data,
+              model
+            );
+            if (translatedChunk) {
+              res.write(translatedChunk);
+            }
+          }
+        }
+
+        try {
+          if (lastGoogleChunk.startsWith("data: ")) {
+            const jsonString = lastGoogleChunk.substring(6).trim();
+            if (jsonString) {
+              const lastResponse = JSON.parse(jsonString);
+              const finishReason =
+                lastResponse.candidates?.[0]?.finishReason || "UNKNOWN";
+              this.logger.info(
+                `✅ [Request] 响应结束，原因: ${finishReason}，请求ID: ${requestId}`
+              );
+            }
+          }
+        } catch (e) {
+          // 解析失败则不记录，以防万一
+        }
+      } else {
+        // 非流式逻辑
+        this._forwardRequest(proxyRequest);
+        await messageQueue.dequeue(); // Header
+        const bodyMsg = await messageQueue.dequeue();
+        const googleResponse = JSON.parse(bodyMsg.data);
+
+        let responseContent = "";
+        const candidate = googleResponse.candidates?.[0];
+
+        if (
+          candidate &&
+          candidate.content &&
+          Array.isArray(candidate.content.parts)
+        ) {
+          // 优先在 parts 中寻找图片数据
+          const imagePart = candidate.content.parts.find((p) => p.inlineData);
+          if (imagePart) {
+            const image = imagePart.inlineData;
+            responseContent = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
+            this.logger.info(
+              "[Adapter] 从 parts.inlineData 中成功解析到图片。"
+            );
+          } else {
+            // 如果没有图片，则拼接所有文本部分
+            responseContent =
+              candidate.content.parts.map((p) => p.text).join("\n") || "";
+          }
+        }
+
+        const openaiResponse = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: model,
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: responseContent },
+              finish_reason: candidate?.finishReason,
+            },
+          ],
+        };
+
+        const finishReason = candidate?.finishReason || "UNKNOWN";
+        this.logger.info(
+          `✅ [Request] 响应结束，原因: ${finishReason}，请求ID: ${requestId}`
+        );
+
+        res.status(200).json(openaiResponse);
+      }
+    } catch (error) {
+      this._handleRequestError(error, res);
+    } finally {
+      this.connectionRegistry.removeMessageQueue(requestId);
+      if (!res.writableEnded) {
+        res.end();
       }
     }
   }
@@ -1004,6 +1161,9 @@ class RequestHandler {
   }
 
   async _handlePseudoStreamResponse(proxyRequest, messageQueue, req, res) {
+    this.logger.info(
+      "[Request] 客户端启用流式传输 (fake)，进入伪流式处理模式..."
+    );
     res.status(200).set({
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -1107,12 +1267,19 @@ class RequestHandler {
       const dataMessage = await messageQueue.dequeue();
       const endMessage = await messageQueue.dequeue();
       if (dataMessage.data) {
-        // (诊断日志逻辑保持不变)
         res.write(`data: ${dataMessage.data}\n\n`);
       }
       if (endMessage.type !== "STREAM_END") {
         this.logger.warn("[Request] 未收到预期的流结束信号。");
       }
+      try {
+        const fullResponse = JSON.parse(dataMessage.data);
+        const finishReason =
+          fullResponse.candidates?.[0]?.finishReason || "UNKNOWN";
+        this.logger.info(
+          `✅ [Request] 响应结束，原因: ${finishReason}，请求ID: ${proxyRequest.request_id}`
+        );
+      } catch (e) {}
       res.write("data: [DONE]\n\n");
     } catch (error) {
       this._handleRequestError(error, res);
@@ -1163,16 +1330,33 @@ class RequestHandler {
     // --- 修改结束 ---
 
     this._setResponseHeaders(res, headerMessage);
-    this.logger.info("[Request] 已向客户端发送真实响应头，开始流式传输...");
+    this.logger.info("[Request] 开始流式传输...");
     try {
+      let lastChunk = "";
       while (true) {
         const dataMessage = await messageQueue.dequeue(30000);
         if (dataMessage.type === "STREAM_END") {
           this.logger.info("[Request] 收到流结束信号。");
           break;
         }
-        if (dataMessage.data) res.write(dataMessage.data);
+        if (dataMessage.data) {
+          res.write(dataMessage.data);
+          lastChunk = dataMessage.data;
+        }
       }
+      try {
+        if (lastChunk.startsWith("data: ")) {
+          const jsonString = lastChunk.substring(6).trim();
+          if (jsonString) {
+            const lastResponse = JSON.parse(jsonString);
+            const finishReason =
+              lastResponse.candidates?.[0]?.finishReason || "UNKNOWN";
+            this.logger.info(
+              `✅ [Request] 响应结束，原因: ${finishReason}，请求ID: ${proxyRequest.request_id}`
+            );
+          }
+        }
+      } catch (e) {}
     } catch (error) {
       if (error.message !== "Queue timeout") throw error;
       this.logger.warn("[Request] 真流式响应超时，可能流已正常结束。");
@@ -1185,20 +1369,17 @@ class RequestHandler {
   }
 
   async _handleNonStreamResponse(proxyRequest, messageQueue, res) {
-    this.logger.info(`[Request] 客户端请求非流式响应，启动标准处理模式...`);
+    this.logger.info(`[Request] 进入非流式处理模式...`);
 
-    // 转发请求到浏览器端，这部分和流式逻辑完全一样
+    // 转发请求到浏览器端
     this._forwardRequest(proxyRequest);
 
     try {
       // 1. 等待响应头信息
       const headerMessage = await messageQueue.dequeue();
       if (headerMessage.event_type === "error") {
-        // 如果浏览器端直接返回错误（如用户取消），则提前结束
-        if (
-          headerMessage.message &&
-          headerMessage.message.includes("The user aborted a request")
-        ) {
+        // ... (错误处理逻辑保持不变)
+        if (headerMessage.message?.includes("The user aborted a request")) {
           this.logger.info(
             `[Request] 请求 #${proxyRequest.request_id} 已被用户妥善取消。`
           );
@@ -1208,7 +1389,6 @@ class RequestHandler {
           );
           await this._handleRequestFailureAndSwitch(headerMessage, null);
         }
-        // 对于非流式请求，即使是错误，也最好返回一个标准的JSON错误体
         return this._sendErrorResponse(
           res,
           headerMessage.status || 500,
@@ -1216,24 +1396,20 @@ class RequestHandler {
         );
       }
 
-      // 2. 准备一个缓冲区，用于拼接所有数据块
+      // 2. 准备一个缓冲区，并确保循环等待直到收到结束信号
       let fullBody = "";
-      let finalMessage;
-
-      // 3. 循环接收数据，直到收到结束信号
       while (true) {
-        const dataMessage = await messageQueue.dequeue(300000); // 300秒超时
-        if (dataMessage.type === "STREAM_END") {
-          this.logger.info("[Request] 收到流结束信号，数据接收完毕。");
+        const message = await messageQueue.dequeue(300000);
+        if (message.type === "STREAM_END") {
+          this.logger.info("[Request] 收到结束信号，数据接收完毕。");
           break;
         }
-        if (dataMessage.data) {
-          fullBody += dataMessage.data;
+        if (message.event_type === "chunk" && message.data) {
+          fullBody += message.data;
         }
-        finalMessage = dataMessage; // 保存最后一条消息用于诊断
       }
 
-      // 4. 重置失败计数器（如果需要）
+      // 3. 重置失败计数器（如果需要）
       if (proxyRequest.is_generative && this.failureCount > 0) {
         this.logger.info(
           `✅ [Auth] 非流式生成请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
@@ -1241,12 +1417,61 @@ class RequestHandler {
         this.failureCount = 0;
       }
 
-      // 5. 设置正确的JSON响应头，并一次性发送全部数据
+      // [核心修正] 对Google原生格式的响应进行智能图片处理
+      try {
+        let parsedBody = JSON.parse(fullBody);
+        let needsReserialization = false;
+
+        const candidate = parsedBody.candidates?.[0];
+        if (candidate?.content?.parts) {
+          const imagePartIndex = candidate.content.parts.findIndex(
+            (p) => p.inlineData
+          );
+
+          if (imagePartIndex > -1) {
+            this.logger.info(
+              "[Proxy] 检测到Google格式响应中的图片数据，正在转换为Markdown..."
+            );
+            const imagePart = candidate.content.parts[imagePartIndex];
+            const image = imagePart.inlineData;
+
+            // 创建一个新的 text part 来替换原来的 inlineData part
+            const markdownTextPart = {
+              text: `![Generated Image](data:${image.mimeType};base64,${image.data})`,
+            };
+
+            // 替换掉原来的部分
+            candidate.content.parts[imagePartIndex] = markdownTextPart;
+            needsReserialization = true;
+          }
+        }
+
+        if (needsReserialization) {
+          fullBody = JSON.stringify(parsedBody); // 如果处理了图片，重新序列化
+        }
+      } catch (e) {
+        this.logger.warn(
+          `[Proxy] 响应体不是有效的JSON，或在处理图片时出错: ${e.message}`
+        );
+        // 如果出错，则什么都不做，直接发送原始的 fullBody
+      }
+
+      try {
+        const fullResponse = JSON.parse(fullBody);
+        const finishReason =
+          fullResponse.candidates?.[0]?.finishReason || "UNKNOWN";
+        this.logger.info(
+          `✅ [Request] 响应结束，原因: ${finishReason}，请求ID: ${proxyRequest.request_id}`
+        );
+      } catch (e) {}
+
+      // 4. 设置正确的JSON响应头，并一次性发送处理过的全部数据
       res
         .status(headerMessage.status || 200)
         .type("application/json")
-        .send(fullBody);
-      this.logger.info(`[Request] 已向客户端发送完整的非流式JSON响应。`);
+        .send(fullBody || "{}");
+
+      this.logger.info(`[Request] 已向客户端发送完整的非流式响应。`);
     } catch (error) {
       this._handleRequestError(error, res);
     }
@@ -1318,6 +1543,170 @@ class RequestHandler {
         .type("application/json")
         .send(JSON.stringify(errorPayload));
     }
+  }
+
+  _translateOpenAIToGoogle(openaiBody, modelName = "") {
+    this.logger.info("[Adapter] 开始将OpenAI请求格式翻译为Google格式...");
+
+    let systemInstruction = null;
+    const googleContents = [];
+
+    // 1. 分离出 system 指令
+    const systemMessages = openaiBody.messages.filter(
+      (msg) => msg.role === "system"
+    );
+    if (systemMessages.length > 0) {
+      // 将所有 system message 的内容合并
+      const systemContent = systemMessages.map((msg) => msg.content).join("\n");
+      systemInstruction = {
+        // Google Gemini 1.5 Pro 开始正式支持 system instruction
+        role: "system",
+        parts: [{ text: systemContent }],
+      };
+    }
+
+    // 2. 转换 user 和 assistant 消息
+    const conversationMessages = openaiBody.messages.filter(
+      (msg) => msg.role !== "system"
+    );
+    for (const message of conversationMessages) {
+      const googleParts = [];
+
+      // [核心改进] 判断 content 是字符串还是数组
+      if (typeof message.content === "string") {
+        // a. 如果是纯文本
+        googleParts.push({ text: message.content });
+      } else if (Array.isArray(message.content)) {
+        // b. 如果是图文混合内容
+        for (const part of message.content) {
+          if (part.type === "text") {
+            googleParts.push({ text: part.text });
+          } else if (part.type === "image_url" && part.image_url) {
+            // 从 data URL 中提取 mimetype 和 base64 数据
+            const dataUrl = part.image_url.url;
+            const match = dataUrl.match(/^data:(image\/.*?);base64,(.*)$/);
+            if (match) {
+              googleParts.push({
+                inlineData: {
+                  mimeType: match[1],
+                  data: match[2],
+                },
+              });
+            }
+          }
+        }
+      }
+
+      googleContents.push({
+        role: message.role === "assistant" ? "model" : "user",
+        parts: googleParts,
+      });
+    }
+
+    // 3. 构建最终的Google请求体
+    const googleRequest = {
+      contents: googleContents,
+      ...(systemInstruction && {
+        systemInstruction: { parts: systemInstruction.parts },
+      }),
+    };
+
+    // 4. 转换生成参数
+    const generationConfig = {
+      temperature: openaiBody.temperature,
+      topP: openaiBody.top_p,
+      topK: openaiBody.top_k,
+      maxOutputTokens: openaiBody.max_tokens,
+      stopSequences: openaiBody.stop,
+    };
+    googleRequest.generationConfig = generationConfig;
+
+    // 5. 安全设置
+    googleRequest.safetySettings = [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+    ];
+
+    this.logger.info("[Adapter] 翻译完成。");
+    return googleRequest;
+  }
+
+  _translateGoogleToOpenAIStream(googleChunk, modelName = "gemini-pro") {
+    if (!googleChunk || googleChunk.trim() === "") {
+      return null;
+    }
+
+    let jsonString = googleChunk;
+    if (jsonString.startsWith("data: ")) {
+      jsonString = jsonString.substring(6).trim();
+    }
+
+    if (!jsonString || jsonString === "[DONE]") return null;
+
+    let googleResponse;
+    try {
+      googleResponse = JSON.parse(jsonString);
+    } catch (e) {
+      this.logger.warn(`[Adapter] 无法解析Google返回的JSON块: ${jsonString}`);
+      return null;
+    }
+
+    const candidate = googleResponse.candidates?.[0];
+    if (!candidate) {
+      if (googleResponse.promptFeedback) {
+        this.logger.warn(
+          `[Adapter] Google返回了promptFeedback，可能已被拦截: ${JSON.stringify(
+            googleResponse.promptFeedback
+          )}`
+        );
+        const errorText = `[ProxySystem Error] Request blocked due to safety settings. Finish Reason: ${googleResponse.promptFeedback.blockReason}`;
+        return `data: ${JSON.stringify({
+          id: `chatcmpl-${this._generateRequestId()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: modelName,
+          choices: [
+            { index: 0, delta: { content: errorText }, finish_reason: "stop" },
+          ],
+        })}\n\n`;
+      }
+      return null;
+    }
+
+    // [核心修正] 引入与非流式一致的图片和文本解析逻辑
+    let content = "";
+    if (candidate.content && Array.isArray(candidate.content.parts)) {
+      const imagePart = candidate.content.parts.find((p) => p.inlineData);
+      if (imagePart) {
+        // 发现图片数据，生成完整的 Markdown 字符串
+        const image = imagePart.inlineData;
+        content = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
+        this.logger.info("[Adapter] 从流式响应块中成功解析到图片。");
+      } else {
+        // 没有图片，则按原样拼接文本
+        content = candidate.content.parts.map((p) => p.text).join("") || "";
+      }
+    }
+
+    const finishReason = candidate.finishReason;
+
+    const openaiResponse = {
+      id: `chatcmpl-${this._generateRequestId()}`,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: modelName,
+      choices: [
+        {
+          index: 0,
+          delta: { content: content },
+          finish_reason: finishReason || null,
+        },
+      ],
+    };
+
+    return `data: ${JSON.stringify(openaiResponse)}\n\n`;
   }
 }
 
@@ -1440,6 +1829,27 @@ class ProxyServerSystem extends EventEmitter {
       config.apiKeys = ["123456"];
       config.apiKeySource = "默认";
       this.logger.info("[System] 未设置任何API Key，已启用默认密码: 123456");
+    }
+
+    const modelsPath = path.join(__dirname, "models.json");
+    try {
+      if (fs.existsSync(modelsPath)) {
+        const modelsFileContent = fs.readFileSync(modelsPath, "utf-8");
+        config.modelList = JSON.parse(modelsFileContent); // 将读取到的模型列表存入config对象
+        this.logger.info(
+          `[System] 已从 models.json 成功加载 ${config.modelList.length} 个模型。`
+        );
+      } else {
+        this.logger.warn(
+          `[System] 未找到 models.json 文件，将使用默认模型列表。`
+        );
+        config.modelList = ["gemini-1.5-pro-latest"]; // 提供一个备用模型，防止服务启动失败
+      }
+    } catch (error) {
+      this.logger.error(
+        `[System] 读取或解析 models.json 失败: ${error.message}，将使用默认模型列表。`
+      );
+      config.modelList = ["gemini-1.5-pro-latest"]; // 出错时也使用备用模型
     }
 
     this.config = config;
@@ -1930,6 +2340,26 @@ class ProxyServerSystem extends EventEmitter {
       }
     });
     app.use(this._createAuthMiddleware());
+
+    app.get("/v1/models", (req, res) => {
+      const modelIds = this.config.modelList || ["gemini-2.5-pro"];
+
+      const models = modelIds.map((id) => ({
+        id: id,
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "google",
+      }));
+
+      res.status(200).json({
+        object: "list",
+        data: models,
+      });
+    });
+
+    app.post("/v1/chat/completions", (req, res) => {
+      this.requestHandler.processOpenAIRequest(req, res);
+    });
     app.all(/(.*)/, (req, res) => {
       this.requestHandler.processRequest(req, res);
     });

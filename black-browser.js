@@ -221,6 +221,7 @@ class RequestProcessor {
       headers: this._sanitizeHeaders(requestSpec.headers),
       signal,
     };
+
     if (
       ["POST", "PUT", "PATCH"].includes(requestSpec.method) &&
       requestSpec.body
@@ -228,72 +229,39 @@ class RequestProcessor {
       try {
         let bodyObj = JSON.parse(requestSpec.body);
 
+        // --- 模块1：智能过滤 (保留) ---
         const isImageModel =
           requestSpec.path.includes("-image-") ||
           requestSpec.path.includes("imagen");
 
         if (isImageModel) {
-          const incompatibleKeys = ["tool_config", "tools", "toolChoice"];
-          let removedKeys = [];
+          const incompatibleKeys = ["tool_config", "toolChoice", "tools"];
           incompatibleKeys.forEach((key) => {
-            if (bodyObj.hasOwnProperty(key)) {
-              delete bodyObj[key];
-              removedKeys.push(key);
-            }
+            if (bodyObj.hasOwnProperty(key)) delete bodyObj[key];
           });
-          if (
-            bodyObj.generationConfig &&
-            bodyObj.generationConfig.hasOwnProperty("thinkingConfig")
-          ) {
+          if (bodyObj.generationConfig?.thinkingConfig) {
             delete bodyObj.generationConfig.thinkingConfig;
-            removedKeys.push("generationConfig.thinkingConfig");
-          }
-          if (removedKeys.length > 0) {
-            Logger.output(
-              `[智能过滤] 已为图像模型移除不兼容参数: ${removedKeys.join(", ")}`
-            );
           }
         }
 
-        // ==========================================================
-        // [最终版] 精确为当前回合的最后文本部分添加签名
-        // ==========================================================
-        if (
-          bodyObj.contents &&
-          Array.isArray(bodyObj.contents) &&
-          bodyObj.contents.length > 0
-        ) {
-          // 1. 直接定位到聊天历史的最后一轮 (即当前用户的输入)
+        // --- 模块2：智能签名 (保留) ---
+        if (bodyObj.contents && bodyObj.contents.length > 0) {
           const currentTurn = bodyObj.contents[bodyObj.contents.length - 1];
-
-          if (currentTurn.parts && Array.isArray(currentTurn.parts)) {
-            // 2. 在当前轮次中，寻找最后一个文本部分
-            let lastTextPart = null;
-            for (let i = currentTurn.parts.length - 1; i >= 0; i--) {
-              if (currentTurn.parts[i].text) {
-                lastTextPart = currentTurn.parts[i];
-                break;
-              }
-            }
-
-            // 3. 为找到的文本部分添加签名
+          if (currentTurn.parts?.length > 0) {
+            let lastTextPart = currentTurn.parts.findLast((p) => p.text);
             if (lastTextPart) {
-              Logger.output(
-                "[智能签名] 已定位到当前回合的文本部分，添加SIG..."
-              );
-              lastTextPart.text += `\n\n[sig:${this._generateRandomString(5)}]`;
+              if (!lastTextPart.text.includes("[sig:")) {
+                lastTextPart.text += `\n\n[sig:${this._generateRandomString(
+                  5
+                )}]`;
+              }
             } else {
-              // 4. 如果当前轮次只有图片没有文本，则新建一个文本part来携带签名
-              Logger.output(
-                "[智能签名] 当前回合无文本，新建文本部分以携带SIG..."
-              );
               currentTurn.parts.push({
                 text: `\n\n[sig:${this._generateRandomString(5)}]`,
               });
             }
           }
         }
-        // ==========================================================
 
         config.body = JSON.stringify(bodyObj);
       } catch (e) {
@@ -301,6 +269,7 @@ class RequestProcessor {
         config.body = requestSpec.body;
       }
     }
+
     return config;
   }
 
@@ -372,12 +341,8 @@ class ProxySystem extends EventTarget {
           break;
         default:
           // 默认情况，认为是代理请求
-          let logText = `收到请求: ${requestSpec.method} ${requestSpec.path}`;
-          // [修改] 只有在客户端明确请求流式传输时，才显示服务器的处理模式
-          if (requestSpec.client_wants_stream) {
-            logText += ` (模式: ${requestSpec.streaming_mode || "fake"})`;
-          }
-          Logger.output(logText);
+          // [最终优化] 直接显示路径，不再显示模式，因为路径本身已足够清晰
+          Logger.output(`收到请求: ${requestSpec.method} ${requestSpec.path}`);
 
           await this._processProxyRequest(requestSpec);
           break;
@@ -394,16 +359,18 @@ class ProxySystem extends EventTarget {
     }
   }
 
-  // --- MODIFIED: _processProxyRequest 方法 ---
+  // 在 v3.4-black-browser.js 中
+  // [最终武器 - Canvas抽魂] 替换整个 _processProxyRequest 函数
   async _processProxyRequest(requestSpec) {
     const operationId = requestSpec.request_id;
     const mode = requestSpec.streaming_mode || "fake";
+    Logger.output(`浏览器收到请求`);
 
     try {
       if (this.requestProcessor.cancelledOperations.has(operationId)) {
         throw new DOMException("The user aborted a request.", "AbortError");
       }
-      const { responsePromise, cancelTimeout } = this.requestProcessor.execute(
+      const { responsePromise } = this.requestProcessor.execute(
         requestSpec,
         operationId
       );
@@ -415,67 +382,39 @@ class ProxySystem extends EventTarget {
       this._transmitHeaders(response, operationId);
       const reader = response.body.getReader();
       const textDecoder = new TextDecoder();
-      let timeoutCancelled = false;
       let fullBody = "";
-      let finalFinishReason = "UNKNOWN";
 
+      // [核心修正] 在循环内部正确分发流式和非流式数据
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (!timeoutCancelled) {
-          cancelTimeout();
-          timeoutCancelled = true;
-        }
+
         const chunk = textDecoder.decode(value, { stream: true });
+
         if (mode === "real") {
-          const lines = chunk.split("\n");
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              try {
-                const jsonData = JSON.parse(line.substring(5));
-                if (jsonData.candidates?.[0]?.finishReason) {
-                  finalFinishReason = jsonData.candidates[0].finishReason;
-                }
-              } catch (e) {}
-            }
-          }
-        }
-        if (mode === "real") {
+          // 流式模式：立即转发每个数据块
           this._transmitChunk(chunk, operationId);
         } else {
+          // fake mode
+          // 非流式模式：拼接数据块，等待最后一次性转发
           fullBody += chunk;
         }
       }
 
       Logger.output("数据流已读取完成。");
-      if (mode === "real") {
-        Logger.output(`✅ [诊断] 响应结束，原因: ${finalFinishReason}`);
-      } else {
-        try {
-          const parsedBody = JSON.parse(fullBody);
-          const finishReason = parsedBody.candidates?.[0]?.finishReason;
-          const safetyRatings = parsedBody.candidates?.[0]?.safetyRatings;
-          Logger.output(`✅ [诊断] 响应结束，原因: ${finishReason || "未知"}`);
-          if (safetyRatings) {
-            Logger.output(
-              `[诊断] 安全评级详情: ${JSON.stringify(safetyRatings)}`
-            );
-          }
-          this._transmitChunk(fullBody, operationId);
-        } catch (e) {
-          Logger.output(`⚠️ [诊断] 响应体不是有效的JSON格式。`);
-          this._transmitChunk(fullBody, operationId);
-        }
+
+      if (mode === "fake") {
+        // 非流式模式下，在循环结束后，转发拼接好的完整响应体
+        this._transmitChunk(fullBody, operationId);
       }
+
       this._transmitStreamEnd(operationId);
     } catch (error) {
-      // --- 核心修改：区分 AbortError 和其他错误 ---
       if (error.name === "AbortError") {
         Logger.output(`[诊断] 操作 #${operationId} 已被用户中止。`);
       } else {
         Logger.output(`❌ 请求处理失败: ${error.message}`);
       }
-      // 无论如何，都需要将最终状态报告给服务器
       this._sendErrorResponse(error, operationId);
     } finally {
       this.requestProcessor.activeOperations.delete(operationId);
